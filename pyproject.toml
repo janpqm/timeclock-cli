@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "timeclock-cli"
+version = "0.1.0"
+description = "Command-line client for timeclock365.com — punch in/out, list entries, set location."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+authors = [
+    { name = "Jan-Henrik Preuss" },
+]
+keywords = ["timeclock", "timeclock365", "cli", "time-tracking"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "requests>=2.31",
+]
+
+[project.scripts]
+tc = "timeclock_cli.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/jan-henrik-preuss/timeclock-cli"
+Issues = "https://github.com/jan-henrik-preuss/timeclock-cli/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+timeclock_cli = ["py.typed"]
