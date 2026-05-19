@@ -25,33 +25,59 @@ On first run `tc` will create a config file at `~/.config/timeclock-cli/config.i
 username         = you@yourcompany.com
 password         = your-password
 default_location = office
+force_overwrite  = false
+list_recent_last = true
 base_url         = https://live.timeclock365.com
 client_id        = ZWUyYzllNGUzYjlhZDAwNzBiYTgwN2ZjYjU2YWZi…
 ```
 
-Only `username` and `password` actually need editing — the other fields are pre-filled with sensible defaults.
+Only `username` and `password` actually need editing — everything else is pre-filled with sensible defaults.
 
-`default_location` is one of `office`, `home`, `abroad`, `field` (the locations timeclock365 accepts). Aliases like `remote` → `home` and `work` → `office` also work on the command line.
-
-`client_id` is the constant the web UI sends to `/api/auth/login`. It's pre-filled here so you can update it without a code change if timeclock365 ever rotates it. Leave it alone unless login starts failing.
+| Key                | Default                                   | Meaning |
+| ------------------ | ----------------------------------------- | ------- |
+| `username`         | —                                         | timeclock365 login |
+| `password`         | —                                         | timeclock365 password |
+| `default_location` | `office`                                  | used by `tc in` when no location is given. One of `office`, `home`, `abroad`, `field`. Aliases like `remote` → `home` and `work` → `office` also work. |
+| `force_overwrite`  | `false`                                   | always overwrite the open session, even without `--force` |
+| `list_recent_last` | `true`                                    | `tc list` order: `true` = oldest first / newest last (tail-style), `false` = newest first |
+| `base_url`         | `https://live.timeclock365.com`           | override only if you have a self-hosted instance |
+| `client_id`        | (the stable web-UI value)                 | rotate here without a code change if timeclock365 ever changes it |
 
 The file is created with mode `0600` (owner read/write only) so other users on the same machine cannot read your password.
 
 ## Usage
 
 ```bash
-tc                       # show current status + period totals
-tc --help                # full help
-tc status                # same as bare `tc`
-tc in                    # punch in (uses default_location if set)
-tc in office             # punch in at 'office'
-tc in home               # punch in at 'home'
-tc out                   # punch out
-tc list                  # last 5 days of entries
-tc list -n 14            # last 14 days
+tc                          # show current status + period totals
+tc --help                   # full help
+tc status                   # same as bare `tc`
+tc in                       # punch in at default_location, right now
+tc in office                # punch in at 'office'
+tc in 7:30                  # punch in retroactively, today at 07:30
+tc in office 7:30           # both — location and a manual time
+tc out                      # punch out, right now
+tc out 18:30                # punch out at 18:30 today
+tc out 18:30 --force        # … and ignore any "you're already out" check
+tc list                     # last 5 days, oldest first (newest at the bottom)
+tc list -n 14               # last 14 days
 ```
 
-Every command logs what it is doing to stderr so you can see exactly which HTTP calls are being made. Pass `-v` or set `TIMECLOCK_LOG=DEBUG` for request-level detail.
+By default the CLI is quiet — only warnings and errors land on stderr. Pass `-v` for INFO-level progress messages (login, network calls), or set `TIMECLOCK_LOG=DEBUG` for full request/response detail.
+
+### `--force`
+
+`tc in HH:MM` and `tc out HH:MM` check the current punch state first and refuse to clobber it. Pass `-f` / `--force` to override:
+
+```bash
+tc in 7:30           # refuses if you're already clocked in
+tc in 7:30 --force   # sends the request anyway
+```
+
+Set `force_overwrite = true` in `config.ini` to make that the default behaviour.
+
+The requested time must be earlier than the current wall clock — `tc in 18:00` at 09:00 is refused unless `--force` is passed.
+
+> Note: retroactive punches (`tc in HH:MM` / `tc out HH:MM`) are best-effort against an undocumented field on the GraphQL `InputWebPunch` type. The server may reject them — if so, the error is surfaced verbatim and we'll need a HAR capture of editing a punch in the web UI to wire up the right mutation. See [NOTES.md](NOTES.md).
 
 ## How it works
 

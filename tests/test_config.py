@@ -150,3 +150,81 @@ client_id = legacy-client-id
     assert cfg.password == "legacy-pw"
     assert cfg.default_location == "field"
     assert cfg.client_id == "legacy-client-id"
+
+
+# ---------------------------------------------------------------- behavior flags
+
+
+def test_force_overwrite_defaults_false(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "config.ini"
+    _write(
+        cfg_path,
+        """\
+[timeclock]
+username = a@b
+password = c
+""",
+    )
+    cfg = load_config(cfg_path)
+    assert cfg.force_overwrite is False
+
+
+def test_force_overwrite_reads_true(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "config.ini"
+    _write(
+        cfg_path,
+        """\
+[timeclock]
+username        = a@b
+password        = c
+force_overwrite = true
+""",
+    )
+    cfg = load_config(cfg_path)
+    assert cfg.force_overwrite is True
+
+
+@pytest.mark.parametrize("raw,expected", [("yes", True), ("on", True), ("1", True),
+                                          ("no", False), ("off", False), ("0", False)])
+def test_force_overwrite_truthy_variants(tmp_path: Path, raw: str, expected: bool) -> None:
+    cfg_path = tmp_path / "config.ini"
+    _write(
+        cfg_path,
+        f"""\
+[timeclock]
+username        = a@b
+password        = c
+force_overwrite = {raw}
+""",
+    )
+    cfg = load_config(cfg_path)
+    assert cfg.force_overwrite is expected
+
+
+def test_list_recent_last_defaults_true(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "config.ini"
+    _write(
+        cfg_path,
+        """\
+[timeclock]
+username = a@b
+password = c
+""",
+    )
+    cfg = load_config(cfg_path)
+    assert cfg.list_recent_last is True
+
+
+def test_list_recent_last_can_be_disabled(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "config.ini"
+    _write(
+        cfg_path,
+        """\
+[timeclock]
+username         = a@b
+password         = c
+list_recent_last = false
+""",
+    )
+    cfg = load_config(cfg_path)
+    assert cfg.list_recent_last is False

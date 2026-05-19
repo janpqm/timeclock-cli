@@ -1,7 +1,9 @@
 """Console logging configuration.
 
 The CLI logs to stderr so command output on stdout stays clean and pipe-able.
-The log level can be raised via the `TIMECLOCK_LOG` env var (e.g. `DEBUG`).
+By default we log at WARNING — quiet runs, only errors and surprises surface.
+Pass ``-v`` for INFO-level progress messages, or set ``TIMECLOCK_LOG=DEBUG``
+for the full request/response detail.
 """
 
 from __future__ import annotations
@@ -11,16 +13,18 @@ import os
 import sys
 
 
-_DEFAULT_LEVEL = "INFO"
+_DEFAULT_LEVEL = "WARNING"
 
 
 def configure_logging(verbose: bool = False) -> logging.Logger:
     """Configure root logging and return the package logger.
 
-    Precedence (highest wins): ``verbose`` flag → ``TIMECLOCK_LOG`` env var → INFO.
+    Precedence (highest wins): ``verbose`` flag → ``TIMECLOCK_LOG`` env var → WARNING.
+    With ``verbose=True`` we elevate to INFO (not DEBUG) — DEBUG is reserved
+    for the env var so casual ``-v`` users don't drown in urllib3 chatter.
     """
-    level_name = "DEBUG" if verbose else os.environ.get("TIMECLOCK_LOG", _DEFAULT_LEVEL)
-    level = getattr(logging, level_name.upper(), logging.INFO)
+    level_name = "INFO" if verbose else os.environ.get("TIMECLOCK_LOG", _DEFAULT_LEVEL)
+    level = getattr(logging, level_name.upper(), logging.WARNING)
 
     handler = logging.StreamHandler(stream=sys.stderr)
     handler.setFormatter(

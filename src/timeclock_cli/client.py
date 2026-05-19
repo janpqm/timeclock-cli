@@ -7,19 +7,39 @@ Implements the flow captured in ``NOTES.md``:
 
 The access token is short-lived (~10 minutes), so we cache it on disk and
 silently re-login when it expires.
+
+Timezones
+---------
+The server is inconsistent about what timezone it returns datetimes in:
+
+* ``DashboardWebPunchQuery.session.startDate`` / ``endDate`` and
+  ``makePunchByDashboard.startDate`` / ``endDate`` are **UTC** strings even
+  though the response also carries a ``timezone`` field.
+* ``DetailedAttendanceReport.records[*].allSessions[*].startDate`` and
+  the lunchSession ``startDateInUserTimezone`` / ``endDateInUserTimezone``
+  fields are **already in the user's timezone**.
+
+We convert everything to timezone-aware ``datetime`` objects at parse time
+and let the CLI format them in the user's local timezone for display.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 import time
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, timedelta
+from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import requests
+
+try:  # zoneinfo is stdlib on Python 3.9+. Windows may need the tzdata wheel.
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover
+    ZoneInfo = None  # type: ignore[assignment]
 
 from .config import Config, session_path
 
@@ -47,6 +67,14 @@ class AuthenticationError(TimeclockError):
     """Login failed or session is no longer valid."""
 
 
+class ConflictError(TimeclockError):
+    """The requested punch would conflict with the current state.
+
+    Raised when the user tries to punch in while already in (or punch out
+    while already out) without ``--force`` / ``force_overwrite=true``.
+    """
+
+
 # ---------------------------------------------------------------- domain models
 
 
@@ -55,8 +83,8 @@ class Entry:
     """A single time-clock session/entry.
 
     ``absence_name`` is set for absence-style records (Vacation, Sick leave,
-    Public Holiday, …) instead of ``location``; for those entries the start
-    and end timestamps span the absence period (typically a full day).
+    Public Holiday, …) instead of ``location``. ``is_lunch=True`` marks lunch
+    break entries (no location either, just start/end times).
     """
 
     started_at: datetime
@@ -64,10 +92,11 @@ class Entry:
     location: Optional[str]
     note: Optional[str] = None
     absence_name: Optional[str] = None
+    is_lunch: bool = False
 
     @property
     def is_open(self) -> bool:
-        return self.ended_at is None and self.absence_name is None
+        return self.ended_at is None and self.absence_name is None and not self.is_lunch
 
     @property
     def is_absence(self) -> bool:
@@ -75,8 +104,12 @@ class Entry:
 
     @property
     def duration(self) -> timedelta:
-        end = self.ended_at or datetime.now()
-        return end - self.started_at
+        if self.ended_at is not None:
+            return self.ended_at - self.started_at
+        # Open entry: compute against "now", matching the tz-awareness of start.
+        if self.started_at.tzinfo is None:
+            return datetime.now() - self.started_at
+        return _now_aware(self.started_at.tzinfo) - self.started_at
 
     def format_line(self) -> str:
         date_str = self.started_at.strftime("%a %Y-%m-%d")
@@ -84,8 +117,30 @@ class Entry:
         if self.is_absence:
             return f"{date_str}  {' ' * 12}  {hours:>5.2f}h  ↳ {self.absence_name}"
         end_str = self.ended_at.strftime("%H:%M") if self.ended_at else "  …  "
+        if self.is_lunch:
+            return f"{date_str}  {self.started_at.strftime('%H:%M')}–{end_str}  {hours:>5.2f}h  ↳ lunch break"
         loc = f" @ {self.location.lower()}" if self.location else ""
         return f"{date_str}  {self.started_at.strftime('%H:%M')}–{end_str}  {hours:>5.2f}h{loc}"
+
+
+@dataclass
+class LunchBreak:
+    """An in-progress or completed lunch break inside the current session."""
+
+    started_at: datetime
+    ended_at: Optional[datetime]
+
+    @property
+    def is_open(self) -> bool:
+        return self.ended_at is None
+
+    @property
+    def duration(self) -> timedelta:
+        if self.ended_at is not None:
+            return self.ended_at - self.started_at
+        if self.started_at.tzinfo is None:
+            return datetime.now() - self.started_at
+        return _now_aware(self.started_at.tzinfo) - self.started_at
 
 
 @dataclass
@@ -96,6 +151,8 @@ class Status:
     today_total: Optional[timedelta] = None
     available_locations: Optional[List[str]] = None
     default_location: Optional[str] = None
+    timezone_name: Optional[str] = None
+    lunch: Optional[LunchBreak] = None
 
 
 @dataclass
@@ -132,7 +189,7 @@ class _Session:
         return time.time() >= (self.expires_at - slack_seconds)
 
 
-# ---------------------------------------------------------------- public helper
+# ---------------------------------------------------------------- public helpers
 
 
 def normalize_location(loc: Optional[str]) -> Optional[str]:
@@ -150,6 +207,36 @@ def normalize_location(loc: Optional[str]) -> Optional[str]:
     raise TimeclockError(
         f"Unknown location {loc!r}. Allowed values: {', '.join(LOCATION_TYPES)}"
     )
+
+
+_CLOCK_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
+
+
+def looks_like_clock_time(s: str) -> bool:
+    """True if ``s`` matches the ``HH:MM`` (or ``H:MM``) clock-time pattern."""
+    return bool(_CLOCK_RE.match(s.strip())) if s else False
+
+
+def parse_clock_time(s: str, *, allow_future: bool = False) -> datetime:
+    """Parse an ``HH:MM`` string as **today** in the system's local timezone.
+
+    Returns a timezone-aware datetime. Raises ``TimeclockError`` if the time
+    is invalid or, when ``allow_future`` is False, lies in the future.
+    """
+    m = _CLOCK_RE.match(s.strip() if s else "")
+    if not m:
+        raise TimeclockError(f"Expected time as HH:MM (e.g. 7:30 or 18:00), got {s!r}")
+    h, mn = int(m.group(1)), int(m.group(2))
+    if not (0 <= h <= 23 and 0 <= mn <= 59):
+        raise TimeclockError(f"Invalid clock time {s!r} — must be 0:00 … 23:59")
+    now_local = datetime.now().astimezone()
+    candidate = now_local.replace(hour=h, minute=mn, second=0, microsecond=0)
+    if not allow_future and candidate > now_local:
+        raise TimeclockError(
+            f"Time {h:02d}:{mn:02d} is in the future "
+            f"(now is {now_local.strftime('%H:%M')}). Refusing — pass --force to override."
+        )
+    return candidate
 
 
 # ---------------------------------------------------------------- the client
@@ -231,7 +318,14 @@ query DetailedAttendanceReport(
                     id
                     startDate
                     endDate
-                    activityLog { locationType }
+                    activityLog {
+                        locationType
+                        lunchSessions {
+                            id
+                            startDateInUserTimezone
+                            endDateInUserTimezone
+                        }
+                    }
                 }
                 allAbsenceTimes {
                     absenceName
@@ -260,6 +354,10 @@ class TimeclockClient:
             "Referer": f"{config.base_url}/en/login",
         })
         self._session: Optional[_Session] = self._load_session()
+        # Tracks whether we've issued DashboardWebPunchQuery this run; some
+        # backends require it as a "warm-up" before they'll serve
+        # DetailedAttendanceReport. See _ensure_warm.
+        self._warmed_up = False
 
     # ----- public API -----
 
@@ -272,7 +370,8 @@ class TimeclockClient:
 
         if not self.config.username or not self.config.password:
             raise AuthenticationError(
-                f"No credentials configured. Edit {self.config.path} and set [auth] username/password."
+                f"No credentials configured. Edit {self.config.path} and set "
+                "username/password under the [timeclock] section."
             )
 
         log.info("Logging in to %s as %s", self.config.base_url, self.config.username)
@@ -337,39 +436,86 @@ class TimeclockClient:
 
         ttl = int(self._session.expires_at - time.time())
         log.info("Authenticated as user_id=%s (token valid for ~%d s)", self._session.user_id, ttl)
+        # Re-login invalidates any previous warm-up.
+        self._warmed_up = False
         self._save_session()
 
-    def punch_in(self, location: Optional[str] = None) -> Entry:
+    def punch_in(
+        self,
+        location: Optional[str] = None,
+        *,
+        at: Optional[datetime] = None,
+        force: bool = False,
+    ) -> Entry:
+        """Punch in.
+
+        ``location`` accepts user-friendly forms (``office``, ``remote``, …).
+        ``at`` optionally specifies a retroactive start time (tz-aware datetime).
+        ``force`` skips the "are you already punched in?" check and lets the
+        server reject the call if it disagrees.
+        """
         loc = normalize_location(location or self.config.default_location)
-        # If no location specified anywhere, fall back to whatever the server says is the user's default.
         if loc is None:
-            self.login()
+            # Fall back to the server-side default location.
             status = self.status()
             loc = status.default_location or "OFFICE"
             log.info("No location given; falling back to server default %s", loc)
-        log.info("Punching in at %s", loc)
-        return self._make_punch(loc, "PUNCH_IN")
 
-    def punch_out(self) -> Entry:
-        # Punch-out still needs a locationType. Use the current open session's
-        # location if we have one, otherwise the server default, otherwise OFFICE.
-        self.login()
+        if not (force or self.config.force_overwrite):
+            status = self.status()
+            if status.clocked_in:
+                raise ConflictError(
+                    f"Already clocked in since {status.since.astimezone().strftime('%H:%M')} "
+                    f"@ {status.location}. Pass --force to overwrite."
+                )
+
+        log.info("Punching in at %s%s", loc, f" (manual start={at:%H:%M})" if at else "")
+        return self._make_punch(loc, "PUNCH_IN", at=at)
+
+    def punch_out(self, *, at: Optional[datetime] = None, force: bool = False) -> Entry:
+        """Punch out, with optional retroactive time and force flag."""
+        # Need the current session's location to send back to the server.
         status = self.status()
         loc = status.location or status.default_location or "OFFICE"
-        log.info("Punching out (location=%s)", loc)
-        return self._make_punch(loc, "PUNCH_OUT")
+
+        if not (force or self.config.force_overwrite):
+            if not status.clocked_in:
+                raise ConflictError(
+                    "Not currently clocked in — nothing to punch out. "
+                    "Pass --force to send the request anyway."
+                )
+
+        log.info("Punching out (location=%s)%s", loc, f" (manual end={at:%H:%M})" if at else "")
+        return self._make_punch(loc, "PUNCH_OUT", at=at)
 
     def status(self) -> Status:
         log.debug("Fetching current status")
         self.login()
         data = self._graphql(_GQL_STATUS, operation_name="DashboardWebPunchQuery")
+        self._warmed_up = True
         wp = data.get("webPunch") or {}
-        session = wp.get("session")
+        session = wp.get("session") or {}
+        tz_name = session.get("timezone") if session else None
         clocked_in = bool(session) and not session.get("endDate")
 
-        since = _parse_dt(session.get("startDate")) if session else None
+        # Status endpoint returns UTC strings (despite the timezone field).
+        since = _parse_utc(session.get("startDate")) if session else None
         location = session.get("locationType") if session else None
-        today_total = since and (datetime.now() - since) if clocked_in else None
+
+        if clocked_in and since is not None:
+            today_total = _now_aware(since.tzinfo) - since
+        else:
+            today_total = None
+
+        lunch_node = wp.get("lunchSession")
+        lunch = None
+        if lunch_node:
+            lstart = _parse_utc(lunch_node.get("startDate"))
+            if lstart is not None:
+                lunch = LunchBreak(
+                    started_at=lstart,
+                    ended_at=_parse_utc(lunch_node.get("endDate")),
+                )
 
         return Status(
             clocked_in=clocked_in,
@@ -378,31 +524,43 @@ class TimeclockClient:
             today_total=today_total,
             available_locations=wp.get("locationTypes") or list(LOCATION_TYPES),
             default_location=wp.get("locationType"),
+            timezone_name=tz_name,
+            lunch=lunch,
         )
 
     def list_entries(self, days: int = 5) -> List[Entry]:
-        """Return recent punch sessions and absences, newest first.
+        """Return recent punch sessions, lunches, and absences.
 
-        ``days`` is the number of calendar days (inclusive of today) to report
-        on. Days with no activity are skipped. A day with two punch-in/out
-        sessions becomes two ``Entry`` objects.
+        Ordering follows the ``list_recent_last`` config option:
+        true → oldest first (newest last), false → newest first.
         """
         end_dt, start_dt = _window_for_days(days)
         report = self._fetch_period_report(int(start_dt.timestamp()), int(end_dt.timestamp()))
+        tz_name = report.get("timezone")
         entries: List[Entry] = []
         for record in report.get("records", []):
             for sess in record.get("allSessions") or []:
-                started = _parse_dt(sess.get("startDate"))
+                started = _parse_in_zone(sess.get("startDate"), tz_name)
                 if started is None:
                     continue
-                location = (sess.get("activityLog") or {}).get("locationType")
+                activity = sess.get("activityLog") or {}
                 entries.append(Entry(
                     started_at=started,
-                    ended_at=_parse_dt(sess.get("endDate")),
-                    location=location,
+                    ended_at=_parse_in_zone(sess.get("endDate"), tz_name),
+                    location=activity.get("locationType"),
                 ))
+                for lunch in activity.get("lunchSessions") or []:
+                    lstart = _parse_in_zone(lunch.get("startDateInUserTimezone"), tz_name)
+                    if lstart is None:
+                        continue
+                    entries.append(Entry(
+                        started_at=lstart,
+                        ended_at=_parse_in_zone(lunch.get("endDateInUserTimezone"), tz_name),
+                        location=None,
+                        is_lunch=True,
+                    ))
             for absence in record.get("allAbsenceTimes") or []:
-                day = _parse_dt(record.get("date"))
+                day = _parse_in_zone(record.get("date"), tz_name)
                 if day is None:
                     continue
                 seconds = int(absence.get("seconds") or 0)
@@ -412,33 +570,52 @@ class TimeclockClient:
                     location=None,
                     absence_name=absence.get("absenceName"),
                 ))
-        entries.sort(key=lambda e: e.started_at, reverse=True)
-        # Truncate to entries whose start falls inside the requested window —
-        # the API sometimes returns the whole payroll period regardless.
-        cutoff = start_dt
-        return [e for e in entries if e.started_at >= cutoff]
+
+        # Filter to the requested window — the server sometimes returns the
+        # whole payroll period regardless of our timestamps.
+        cutoff = start_dt.astimezone(entries[0].started_at.tzinfo) if entries else start_dt
+        entries = [e for e in entries if e.started_at >= cutoff]
+
+        recent_last = self.config.list_recent_last
+        entries.sort(key=lambda e: e.started_at, reverse=not recent_last)
+        return entries
 
     def period_summary(self) -> PeriodSummary:
         """Aggregate totals for the current payroll period (server-defined)."""
         end_dt, start_dt = _window_for_days(31)  # any window inside the period works
         report = self._fetch_period_report(int(start_dt.timestamp()), int(end_dt.timestamp()))
+        tz_name = report.get("timezone")
         return PeriodSummary(
-            start=_parse_dt(report.get("startDate")) or start_dt,
-            end=_parse_dt(report.get("endDate")) or end_dt,
+            start=_parse_in_zone(report.get("startDate"), tz_name) or start_dt.astimezone(),
+            end=_parse_in_zone(report.get("endDate"), tz_name) or end_dt.astimezone(),
             total_hours=float(report.get("totalHours") or 0),
             standard_hours=float(report.get("totalStandardHours") or 0),
             credit_hours=float(report.get("creditHours") or 0),
             lack_of_hours=float(report.get("totalLackOfHours") or 0),
             absence_hours=float(report.get("totalAbsenceHours") or 0),
             days_worked=int(report.get("totalDaysWorked") or 0),
-            timezone=str(report.get("timezone") or ""),
+            timezone=str(tz_name or ""),
         )
 
     # ----- internals -----
 
+    def _ensure_warm(self) -> None:
+        """Some backends 400 on DetailedAttendanceReport unless we've called
+        DashboardWebPunchQuery first this run. Issue it once, idempotently."""
+        if self._warmed_up:
+            return
+        log.debug("Issuing warm-up DashboardWebPunchQuery before report call")
+        try:
+            self._graphql(_GQL_STATUS, operation_name="DashboardWebPunchQuery")
+        except Exception as exc:  # noqa: BLE001 — warm-up is best-effort
+            log.debug("Warm-up failed (continuing anyway): %s", exc)
+        finally:
+            self._warmed_up = True
+
     def _fetch_period_report(self, start_ts: int, end_ts: int) -> dict:
         """Run DetailedAttendanceReport and return the single element block."""
         self.login()
+        self._ensure_warm()
         company_id = self._ensure_company_id()
         assert self._session is not None
         variables = {
@@ -508,21 +685,47 @@ class TimeclockClient:
         log.debug("Cached company_id=%d", company_id)
         return company_id
 
-
-
-    def _make_punch(self, location: str, punch_type: str) -> Entry:
+    def _make_punch(
+        self,
+        location: str,
+        punch_type: str,
+        *,
+        at: Optional[datetime] = None,
+    ) -> Entry:
         self.login()
-        data = self._graphql(
-            _GQL_MAKE_PUNCH,
-            operation_name="makePunchDashboard",
-            variables={"punch": {"locationType": location, "punchType": punch_type}},
-        )
+        punch: dict = {"locationType": location, "punchType": punch_type}
+        if at is not None:
+            # The server expects UTC datetimes elsewhere; mirror that convention.
+            utc_str = at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            field = "startDate" if punch_type == "PUNCH_IN" else "endDate"
+            punch[field] = utc_str
+            log.info(
+                "Sending retroactive %s with %s=%s UTC (— if the server rejects, "
+                "the InputWebPunch schema needs a HAR capture; see NOTES.md)",
+                punch_type, field, utc_str,
+            )
+        try:
+            data = self._graphql(
+                _GQL_MAKE_PUNCH,
+                operation_name="makePunchDashboard",
+                variables={"punch": punch},
+            )
+        except TimeclockError as exc:
+            if at is not None:
+                raise TimeclockError(
+                    "Retroactive punch failed — most likely the InputWebPunch "
+                    "schema doesn't accept the field we tried. Capture a HAR of "
+                    "editing a punch time in the web UI so we can wire up the "
+                    f"right mutation. Server said: {exc}"
+                ) from exc
+            raise
+
         node = data.get("makePunchByDashboard")
         if not node:
             raise TimeclockError(f"Punch response missing makePunchByDashboard: {data}")
         return Entry(
-            started_at=_parse_dt(node["startDate"]),
-            ended_at=_parse_dt(node.get("endDate")),
+            started_at=_parse_utc(node["startDate"]),
+            ended_at=_parse_utc(node.get("endDate")),
             location=node.get("locationType"),
         )
 
@@ -613,14 +816,22 @@ def _safe_json(resp: requests.Response) -> dict:
         raise TimeclockError(f"Expected JSON but got: {resp.text[:200]!r}") from exc
 
 
-def _parse_dt(value: Optional[str]) -> Optional[datetime]:
-    """Parse the ``"2026-05-19 05:38:39"`` format the server returns."""
+def _resolve_tz(name: Optional[str]):
+    """Return a tzinfo for ``name`` or the system local one if unavailable."""
+    if name and ZoneInfo is not None:
+        try:
+            return ZoneInfo(name)
+        except Exception:  # noqa: BLE001 — bad name or missing tzdata
+            log.debug("Could not resolve timezone %r — falling back to local", name)
+    return datetime.now().astimezone().tzinfo
+
+
+def _parse_naive(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
     try:
         return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
     except ValueError:
-        # Fallback: try ISO-8601 just in case the server ever returns it.
         try:
             return datetime.fromisoformat(value)
         except ValueError:
@@ -628,15 +839,46 @@ def _parse_dt(value: Optional[str]) -> Optional[datetime]:
             return None
 
 
-def _window_for_days(days: int) -> tuple:
+def _parse_utc(value: Optional[str]) -> Optional[datetime]:
+    """Parse a server datetime as UTC and return a tz-aware datetime."""
+    naive = _parse_naive(value)
+    if naive is None:
+        return None
+    if naive.tzinfo is None:
+        return naive.replace(tzinfo=timezone.utc)
+    return naive.astimezone(timezone.utc)
+
+
+def _parse_in_zone(value: Optional[str], tz_name: Optional[str]) -> Optional[datetime]:
+    """Parse a server datetime that's already in ``tz_name`` (or local) wall clock."""
+    naive = _parse_naive(value)
+    if naive is None:
+        return None
+    if naive.tzinfo is not None:
+        return naive
+    return naive.replace(tzinfo=_resolve_tz(tz_name))
+
+
+def _parse_dt(value: Optional[str]) -> Optional[datetime]:
+    """Backwards-compatible alias for ``_parse_naive`` — used by tests."""
+    return _parse_naive(value)
+
+
+def _now_aware(tz=None) -> datetime:
+    """Current time as a tz-aware ``datetime``. Uses the given tz or the local one."""
+    if tz is None:
+        return datetime.now().astimezone()
+    return datetime.now(tz=tz)
+
+
+def _window_for_days(days: int) -> Tuple[datetime, datetime]:
     """Return ``(end_dt, start_dt)`` covering the last ``days`` calendar days.
 
-    The window is inclusive on both ends: today 00:00 through today 23:59:59 is
-    one day. Timestamps are local-time based since the report API interprets
-    timestamps in the user's timezone via the ``timezone`` field on the user.
+    Both bounds are timezone-aware (system local). The window is inclusive on
+    both ends: today 00:00 through today 23:59:59 is one day.
     """
     days = max(1, int(days))
-    now = datetime.now()
+    now = datetime.now().astimezone()
     end_dt = now.replace(hour=23, minute=59, second=59, microsecond=0)
     start_dt = (now - timedelta(days=days - 1)).replace(
         hour=0, minute=0, second=0, microsecond=0

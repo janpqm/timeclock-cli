@@ -1,13 +1,17 @@
 """Command-line entry point.
 
 Usage:
-    tc                  → status (default)
-    tc status           → status
-    tc in [location]    → punch in
-    tc out              → punch out
-    tc list [-n DAYS]   → list recent entries
+    tc                       → status (default)
+    tc status                → status
+    tc in [location] [HH:MM] → punch in (optionally retroactive)
+    tc out [HH:MM]           → punch out (optionally retroactive)
+    tc list [-n DAYS]        → list recent entries
     tc --version
     tc --help
+
+``-f`` / ``--force`` overrides the "already punched in / out" safety check
+on the ``in`` / ``out`` subcommands. The same effect can be made permanent
+via ``force_overwrite = true`` in ``config.ini``.
 """
 
 from __future__ import annotations
@@ -15,12 +19,21 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import requests.exceptions
 
 from . import __version__
-from .client import AuthenticationError, TimeclockClient, TimeclockError
+from .client import (
+    AuthenticationError,
+    ConflictError,
+    LunchBreak,
+    TimeclockClient,
+    TimeclockError,
+    looks_like_clock_time,
+    normalize_location,
+    parse_clock_time,
+)
 from .config import Config, load_config
 from .logging_setup import configure_logging
 
@@ -35,26 +48,44 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  tc                 show current status (default)\n"
-            "  tc in              punch in (uses default location if set)\n"
-            "  tc in office       punch in at 'office'\n"
-            "  tc out             punch out\n"
-            "  tc list -n 14      list the last 14 days of entries\n"
+            "  tc                       show current status (default)\n"
+            "  tc in                    punch in at the default location, now\n"
+            "  tc in office             punch in at 'office', now\n"
+            "  tc in 7:30               punch in retroactively at 07:30 today\n"
+            "  tc in office 7:30        punch in at 'office', 07:30 today\n"
+            "  tc out                   punch out, now\n"
+            "  tc out 18:30 --force     punch out at 18:30 today, override safety check\n"
+            "  tc list -n 14            list the last 14 days of entries\n"
         ),
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    parser.add_argument("-v", "--verbose", action="store_true", help="enable debug logging")
+    parser.add_argument("-v", "--verbose", action="store_true", help="enable verbose logging")
 
     sub = parser.add_subparsers(dest="command", metavar="{in,out,list,status}")
 
     p_in = sub.add_parser("in", help="punch in")
     p_in.add_argument(
-        "location",
-        nargs="?",
-        help="optional location label (e.g. office, home). Falls back to [defaults] location in config.ini.",
+        "args",
+        nargs="*",
+        metavar="LOCATION|HH:MM",
+        help="optional location and/or HH:MM start time, in any order",
+    )
+    p_in.add_argument(
+        "-f", "--force", action="store_true",
+        help="overwrite the open session if one already exists",
     )
 
-    sub.add_parser("out", help="punch out")
+    p_out = sub.add_parser("out", help="punch out")
+    p_out.add_argument(
+        "time",
+        nargs="?",
+        metavar="HH:MM",
+        help="optional end time (HH:MM) to record",
+    )
+    p_out.add_argument(
+        "-f", "--force", action="store_true",
+        help="ignore the 'already punched out' check",
+    )
 
     p_list = sub.add_parser("list", help="list recent entries")
     p_list.add_argument(
@@ -73,15 +104,50 @@ def build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------- command impls
 
 
+def _split_in_args(raw: List[str]) -> Tuple[Optional[str], Optional[str]]:
+    """Split ``tc in`` positional arguments into ``(location, time_str)``.
+
+    Accepted forms:
+        []                          → (None, None)
+        ["office"]                  → ("office", None)
+        ["7:30"]                    → (None, "7:30")
+        ["office", "7:30"]          → ("office", "7:30")
+        ["7:30", "office"]          → ("office", "7:30")
+    """
+    if not raw:
+        return None, None
+    times = [a for a in raw if looks_like_clock_time(a)]
+    others = [a for a in raw if not looks_like_clock_time(a)]
+    if len(times) > 1 or len(others) > 1:
+        raise TimeclockError(
+            "Too many positional arguments to `tc in`. Expected at most one "
+            "location and one HH:MM time."
+        )
+    return (others[0] if others else None, times[0] if times else None)
+
+
+def _lunch_line(lunch: LunchBreak) -> str:
+    """Format the in-progress lunch break shown by `tc` / `tc status`."""
+    start = lunch.started_at.astimezone().strftime("%H:%M")
+    if lunch.ended_at is None:
+        return f"on lunch since {start}"
+    end = lunch.ended_at.astimezone().strftime("%H:%M")
+    minutes = lunch.duration.total_seconds() / 60
+    return f"lunch: {start}–{end} ({minutes:.0f} min)"
+
+
 def _cmd_status(client: TimeclockClient) -> int:
     status = client.status()
     if status.clocked_in:
-        when = status.since.strftime("%a %H:%M") if status.since else "?"
+        # since is tz-aware UTC; .astimezone() flips to local for display.
+        when = status.since.astimezone().strftime("%a %H:%M") if status.since else "?"
         loc = f" @ {status.location.lower()}" if status.location else ""
         print(f"clocked IN since {when}{loc}")
         if status.today_total is not None:
             hours = status.today_total.total_seconds() / 3600
             print(f"running: {hours:.2f}h")
+        if status.lunch is not None:
+            print(_lunch_line(status.lunch))
     else:
         print("clocked OUT")
         if status.default_location:
@@ -109,17 +175,23 @@ def _cmd_status(client: TimeclockClient) -> int:
     return 0
 
 
-def _cmd_in(client: TimeclockClient, location: Optional[str]) -> int:
-    entry = client.punch_in(location)
+def _cmd_in(client: TimeclockClient, raw_args: List[str], force: bool) -> int:
+    location, time_str = _split_in_args(raw_args)
+    # Validate the location string early (catches typos before we hit network).
+    if location is not None:
+        normalize_location(location)
+    at = parse_clock_time(time_str, allow_future=force) if time_str else None
+    entry = client.punch_in(location, at=at, force=force)
     loc = (entry.location or "").lower()
-    when = entry.started_at.strftime("%H:%M") if entry.started_at else "?"
+    when = entry.started_at.astimezone().strftime("%H:%M") if entry.started_at else "?"
     print(f"punched in @ {loc} at {when}")
     return 0
 
 
-def _cmd_out(client: TimeclockClient) -> int:
-    entry = client.punch_out()
-    when = entry.ended_at.strftime("%H:%M") if entry.ended_at else "?"
+def _cmd_out(client: TimeclockClient, time_str: Optional[str], force: bool) -> int:
+    at = parse_clock_time(time_str, allow_future=force) if time_str else None
+    entry = client.punch_out(at=at, force=force)
+    when = entry.ended_at.astimezone().strftime("%H:%M") if entry.ended_at else "?"
     hours = entry.duration.total_seconds() / 3600
     print(f"punched out at {when} — {hours:.2f}h")
     return 0
@@ -153,7 +225,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if not config.is_complete():
         log.error(
-            "No credentials configured. Edit %s and set [auth] username/password.",
+            "No credentials configured. Edit %s and set username/password "
+            "under the [timeclock] section.",
             config.path,
         )
         return 2
@@ -165,9 +238,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         if command == "status":
             return _cmd_status(client)
         if command == "in":
-            return _cmd_in(client, args.location)
+            return _cmd_in(client, args.args, args.force)
         if command == "out":
-            return _cmd_out(client)
+            return _cmd_out(client, args.time, args.force)
         if command == "list":
             return _cmd_list(client, args.days)
         parser.error(f"unknown command: {command}")  # exits with code 2
@@ -175,6 +248,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     except AuthenticationError as exc:
         log.error("Authentication failed: %s", exc)
         return 3
+    except ConflictError as exc:
+        log.error("%s", exc)
+        return 6
     except NotImplementedError as exc:
         log.error("%s", exc)
         log.error("This part of the flow has not been captured yet — see NOTES.md.")

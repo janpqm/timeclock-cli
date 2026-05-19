@@ -48,6 +48,14 @@ password         = your-password
 # Allowed values: office, home, abroad, field (case-insensitive).
 default_location = office
 
+# Allow `tc in HH:MM` / `tc out HH:MM` to overwrite the currently-open session
+# when one already exists. Per-invocation override: pass `-f` / `--force`.
+force_overwrite  = false
+
+# `tc list` ordering. true = oldest first, newest last (like `tail`);
+#                   false = newest first, oldest last.
+list_recent_last = true
+
 # Override only if you point at a self-hosted timeclock365 instance.
 base_url         = {DEFAULT_BASE_URL}
 
@@ -66,9 +74,23 @@ class Config:
     default_location: Optional[str]
     path: Path
     client_id: str = DEFAULT_CLIENT_ID
+    force_overwrite: bool = False
+    list_recent_last: bool = True
 
     def is_complete(self) -> bool:
         return bool(self.username and self.password)
+
+
+def _to_bool(value: str, default: bool = False) -> bool:
+    """Parse the usual ini-file truthy/falsy spellings."""
+    if value is None:
+        return default
+    s = str(value).strip().lower()
+    if s in {"1", "true", "yes", "on"}:
+        return True
+    if s in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 
 def config_dir() -> Path:
@@ -133,7 +155,7 @@ def load_config(path: Optional[Path] = None) -> Config:
             default_location=None,
             path=cfg_path,
             client_id=DEFAULT_CLIENT_ID,
-        )
+        )  # force_overwrite and list_recent_last keep dataclass defaults
 
     parser = configparser.ConfigParser()
     parser.read(cfg_path, encoding="utf-8")
@@ -148,6 +170,8 @@ def load_config(path: Optional[Path] = None) -> Config:
         ("defaults", "location"),
     ) or None
     client_id = _get(parser, (SECTION, "client_id"), ("server", "client_id")) or DEFAULT_CLIENT_ID
+    force_overwrite = _to_bool(_get(parser, (SECTION, "force_overwrite")), default=False)
+    list_recent_last = _to_bool(_get(parser, (SECTION, "list_recent_last")), default=True)
 
     # Don't ignore obvious template placeholders — treat them as "not configured".
     if username in {"you@yourcompany.com", "your.email@example.com"}:
@@ -173,4 +197,6 @@ def load_config(path: Optional[Path] = None) -> Config:
         default_location=default_location,
         path=cfg_path,
         client_id=client_id,
+        force_overwrite=force_overwrite,
+        list_recent_last=list_recent_last,
     )

@@ -193,9 +193,32 @@ query MeAndCompany {
 }
 ```
 
+## Timezone gotcha
+
+The server is inconsistent. From the same authenticated session:
+
+- `DashboardWebPunchQuery.session.startDate` is **UTC** ("2026-05-19 05:38:39" for a 07:38 Berlin punch).
+- `makePunchByDashboard.startDate` / `endDate` are **UTC** too.
+- `DetailedAttendanceReport.records[*].allSessions[*].startDate` is **already in the user's timezone** (no conversion needed).
+- `record.allSessions[*].activityLog.lunchSessions[*].startDateInUserTimezone` — the field name says it all.
+
+The CLI parses each one with the right helper (`_parse_utc` vs `_parse_in_zone`) and stores everything as timezone-aware datetimes internally. Display goes through `.astimezone()` to the user's local zone.
+
+## "no access to report" intermittent 400
+
+A fresh login can occasionally serve `DetailedAttendanceReport` a 400 with `{"code":400,"errors":[{"code":400,"message":"no access to report"}]}` for the first few seconds. Once `DashboardWebPunchQuery` has been called successfully, the report query starts working again.
+
+Workaround: `TimeclockClient._ensure_warm()` issues `DashboardWebPunchQuery` once per session before any report call. This is best-effort and silently swallowed if it itself fails.
+
+## Retroactive punches — NOT YET CAPTURED
+
+We don't have a HAR of the "edit a punch time" flow. The CLI accepts `tc in HH:MM` / `tc out HH:MM` and optimistically sends a `startDate` / `endDate` (UTC string) on the `InputWebPunch` payload, but the server may reject this if those fields aren't on the input type.
+
+To finish this, open the web UI's "edit punch" dialog, modify a session's start or end time, and export a HAR. The relevant mutation will be visible there.
+
 ## Open questions / TODO
 
-- Does the access-token alone work without the `AUTH` cookie? (testing required — user expects yes.)
-- Token refresh: the response includes `refresh_token` + `refresh_expires_at` (5 min after access expires). For a CLI we may just re-login when access expires — simpler than implementing refresh.
+- Does the access-token alone work without the `AUTH` cookie? Practical testing says yes.
+- Token refresh: the response includes `refresh_token` + `refresh_expires_at` (5 min after access expires). For a CLI we just re-login when access expires — simpler than implementing refresh.
 - Are `BC-Mode: swap` and `Use-Http-Code: 1` required for mutations, or just hints?
 - Does timeclock365 throttle / rate-limit?
