@@ -2,6 +2,11 @@
 
 Reads ``~/.config/timeclock-cli/config.ini`` (or the platform-equivalent
 ``XDG_CONFIG_HOME``). On first run, writes a template the user can edit.
+
+All keys live under a single ``[timeclock]`` section to keep the file flat
+and editable. The previous multi-section layout (``[auth]``/``[defaults]``/
+``[server]``) is still read for backwards compatibility, but the template we
+write — and the format documented in the README — uses the single section.
 """
 
 from __future__ import annotations
@@ -18,6 +23,7 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
+SECTION = "timeclock"
 DEFAULT_BASE_URL = "https://live.timeclock365.com"
 
 # Stable per-app constant the web UI sends as `client_id` to /api/auth/login.
@@ -29,25 +35,26 @@ DEFAULT_CLIENT_ID = (
 
 _TEMPLATE = f"""\
 # timeclock-cli configuration
-# Fill in your timeclock365 credentials, then run `tc status` to verify.
+# Fill in your credentials below, then run `tc status` to verify.
+# Permissions on this file should be 0600 (owner-only); the tool sets that on
+# first write and will warn if it gets relaxed later.
 
-[auth]
-username =
-password =
+[timeclock]
+# Your timeclock365 login.
+username         = you@yourcompany.com
+password         = your-password
 
-[defaults]
-# Optional default location for `tc in` when none is given on the command line.
+# Default location for `tc in` when none is given on the command line.
 # Allowed values: office, home, abroad, field (case-insensitive).
-location =
+default_location = office
 
-[server]
 # Override only if you point at a self-hosted timeclock365 instance.
-base_url = {DEFAULT_BASE_URL}
+base_url         = {DEFAULT_BASE_URL}
 
 # client_id sent to /api/auth/login. This is the stable value the web UI uses.
 # If timeclock365 ever rotates it (login starts returning a non-200), capture
 # the new value from DevTools and paste it here — no code change needed.
-client_id = {DEFAULT_CLIENT_ID}
+client_id        = {DEFAULT_CLIENT_ID}
 """
 
 
@@ -96,6 +103,20 @@ def _write_template(path: Path) -> None:
     log.info("Wrote config template to %s — fill in your credentials and re-run.", path)
 
 
+def _get(parser: configparser.ConfigParser, *candidates) -> str:
+    """Return the first non-empty value across the given (section, key) pairs.
+
+    Lets a single call accept both the modern ``[timeclock]`` layout and the
+    older ``[auth]``/``[defaults]``/``[server]`` one for backwards compat.
+    """
+    for section, key in candidates:
+        if parser.has_option(section, key):
+            val = parser.get(section, key, fallback="").strip()
+            if val:
+                return val
+    return ""
+
+
 def load_config(path: Optional[Path] = None) -> Config:
     """Load config from disk. Writes a template and exits if missing."""
     cfg_path = path or config_path()
@@ -117,11 +138,22 @@ def load_config(path: Optional[Path] = None) -> Config:
     parser = configparser.ConfigParser()
     parser.read(cfg_path, encoding="utf-8")
 
-    username = parser.get("auth", "username", fallback="").strip()
-    password = parser.get("auth", "password", fallback="").strip()
-    base_url = parser.get("server", "base_url", fallback=DEFAULT_BASE_URL).strip() or DEFAULT_BASE_URL
-    default_location = parser.get("defaults", "location", fallback="").strip() or None
-    client_id = parser.get("server", "client_id", fallback="").strip() or DEFAULT_CLIENT_ID
+    username = _get(parser, (SECTION, "username"), ("auth", "username"))
+    password = _get(parser, (SECTION, "password"), ("auth", "password"))
+    base_url = _get(parser, (SECTION, "base_url"), ("server", "base_url")) or DEFAULT_BASE_URL
+    default_location = _get(
+        parser,
+        (SECTION, "default_location"),
+        (SECTION, "location"),
+        ("defaults", "location"),
+    ) or None
+    client_id = _get(parser, (SECTION, "client_id"), ("server", "client_id")) or DEFAULT_CLIENT_ID
+
+    # Don't ignore obvious template placeholders — treat them as "not configured".
+    if username in {"you@yourcompany.com", "your.email@example.com"}:
+        username = ""
+    if password in {"your-password", "your_password"}:
+        password = ""
 
     # Warn about world-readable config (skip on Windows where mode bits are meaningless).
     if sys.platform != "win32":

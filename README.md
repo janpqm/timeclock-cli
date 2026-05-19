@@ -18,49 +18,66 @@ This exposes a `tc` command on your `$PATH`.
 
 ## Configure
 
-On first run `tc` will create a config file at `~/.config/timeclock-cli/config.ini` (Linux/macOS) or the equivalent on Windows. Edit it and fill in your credentials:
+On first run `tc` will create a config file at `~/.config/timeclock-cli/config.ini` (Linux/macOS) or the equivalent on Windows. Open it and fill in your credentials:
 
 ```ini
-[auth]
-username = your.email@example.com
-password = your-password
-
-[defaults]
-# Optional default location for `tc in` when no location is given
-location = office
-
-[server]
-# Override only if you use a self-hosted timeclock365
-base_url = https://live.timeclock365.com
+[timeclock]
+username         = you@yourcompany.com
+password         = your-password
+default_location = office
+base_url         = https://live.timeclock365.com
+client_id        = ZWUyYzllNGUzYjlhZDAwNzBiYTgwN2ZjYjU2YWZi…
 ```
+
+Only `username` and `password` actually need editing — the other fields are pre-filled with sensible defaults.
+
+`default_location` is one of `office`, `home`, `abroad`, `field` (the locations timeclock365 accepts). Aliases like `remote` → `home` and `work` → `office` also work on the command line.
+
+`client_id` is the constant the web UI sends to `/api/auth/login`. It's pre-filled here so you can update it without a code change if timeclock365 ever rotates it. Leave it alone unless login starts failing.
 
 The file is created with mode `0600` (owner read/write only) so other users on the same machine cannot read your password.
 
 ## Usage
 
 ```bash
-tc                       # show current status (clocked in / out, today's hours)
+tc                       # show current status + period totals
 tc --help                # full help
 tc status                # same as bare `tc`
-tc in                    # punch in (uses default location if set)
-tc in office             # punch in with location "office"
-tc in home               # punch in with location "home"
+tc in                    # punch in (uses default_location if set)
+tc in office             # punch in at 'office'
+tc in home               # punch in at 'home'
 tc out                   # punch out
 tc list                  # last 5 days of entries
 tc list -n 14            # last 14 days
 ```
 
-Every command logs what it is doing to stderr so you can see exactly which HTTP calls are being made — set `TIMECLOCK_LOG=DEBUG` to see request/response details.
+Every command logs what it is doing to stderr so you can see exactly which HTTP calls are being made. Pass `-v` or set `TIMECLOCK_LOG=DEBUG` for request-level detail.
 
 ## How it works
 
-`tc` logs in to `live.timeclock365.com` using your username/password, stores the session cookie on disk (so subsequent calls don't re-authenticate), and replays the same API requests the web UI makes for punching, listing, and status checks.
+`tc` authenticates against `live.timeclock365.com` in two steps (`/api/auth/login` then `/api/auth/check`) and stores the resulting `access-token` in `~/.config/timeclock-cli/session.json`. Subsequent commands reuse the token until it expires (~10 minutes), then silently re-login.
 
-If timeclock365 rotates your session, the next `tc` invocation will silently log in again.
+Once authenticated, the CLI talks to the same GraphQL endpoint the web UI uses:
 
-## Project status
+- `DashboardWebPunchQuery` for current status
+- `makePunchByDashboard` for punch in / out
+- `DetailedAttendanceReport` for `tc list` and the period summary shown by `tc status`
 
-Early alpha. The HTTP calls in `timeclock_cli/client.py` are placeholders pending capture of the real flow from the web UI. See `NOTES.md` for the in-progress reverse-engineering notes.
+See [NOTES.md](NOTES.md) for the captured request shapes and open questions.
+
+## Development
+
+Clone, set up a virtualenv, install in editable mode with the test extras, then run the suite:
+
+```bash
+git clone https://github.com/jan-henrik-preuss/timeclock-cli
+cd timeclock-cli
+python -m venv .venv && source .venv/bin/activate
+pip install -e '.[dev]'
+pytest
+```
+
+The tests are offline-only — they exercise config parsing, location normalization, the date-window helper, and `Entry` formatting. The HTTP layer is reviewed against the HAR captures in `flows/` (not checked in by default).
 
 ## License
 
