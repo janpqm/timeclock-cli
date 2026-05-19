@@ -20,7 +20,14 @@ log = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "https://live.timeclock365.com"
 
-_TEMPLATE = """\
+# Stable per-app constant the web UI sends as `client_id` to /api/auth/login.
+# It's the same value across every captured session. If timeclock365 ever
+# rotates this, users can override it in config.ini without a code change.
+DEFAULT_CLIENT_ID = (
+    "ZWUyYzllNGUzYjlhZDAwNzBiYTgwN2ZjYjU2YWZiNDRhZDhiYTFkNmM5NTkzNzJlNDc1NzRkM2Y5OGFiODc0Nw"
+)
+
+_TEMPLATE = f"""\
 # timeclock-cli configuration
 # Fill in your timeclock365 credentials, then run `tc status` to verify.
 
@@ -35,12 +42,12 @@ location =
 
 [server]
 # Override only if you point at a self-hosted timeclock365 instance.
-base_url = https://live.timeclock365.com
+base_url = {DEFAULT_BASE_URL}
 
-# Optional: override the client_id sent to /api/auth/login. Leave empty to use
-# the default value the web UI sends. Change only if /api/auth/login starts
-# rejecting requests and you've captured a new client_id from DevTools.
-client_id =
+# client_id sent to /api/auth/login. This is the stable value the web UI uses.
+# If timeclock365 ever rotates it (login starts returning a non-200), capture
+# the new value from DevTools and paste it here — no code change needed.
+client_id = {DEFAULT_CLIENT_ID}
 """
 
 
@@ -51,7 +58,7 @@ class Config:
     base_url: str
     default_location: Optional[str]
     path: Path
-    client_id: Optional[str] = None
+    client_id: str = DEFAULT_CLIENT_ID
 
     def is_complete(self) -> bool:
         return bool(self.username and self.password)
@@ -104,7 +111,7 @@ def load_config(path: Optional[Path] = None) -> Config:
             base_url=DEFAULT_BASE_URL,
             default_location=None,
             path=cfg_path,
-            client_id=None,
+            client_id=DEFAULT_CLIENT_ID,
         )
 
     parser = configparser.ConfigParser()
@@ -114,7 +121,7 @@ def load_config(path: Optional[Path] = None) -> Config:
     password = parser.get("auth", "password", fallback="").strip()
     base_url = parser.get("server", "base_url", fallback=DEFAULT_BASE_URL).strip() or DEFAULT_BASE_URL
     default_location = parser.get("defaults", "location", fallback="").strip() or None
-    client_id = parser.get("server", "client_id", fallback="").strip() or None
+    client_id = parser.get("server", "client_id", fallback="").strip() or DEFAULT_CLIENT_ID
 
     # Warn about world-readable config (skip on Windows where mode bits are meaningless).
     if sys.platform != "win32":

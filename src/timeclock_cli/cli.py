@@ -86,6 +86,26 @@ def _cmd_status(client: TimeclockClient) -> int:
         print("clocked OUT")
         if status.default_location:
             print(f"default location: {status.default_location.lower()}")
+
+    # Period totals — best-effort. If the report query fails we still want
+    # status to succeed, so swallow errors quietly.
+    try:
+        period = client.period_summary()
+    except Exception as exc:  # noqa: BLE001
+        log.debug("Could not fetch period summary: %s", exc)
+    else:
+        # %-d isn't portable to Windows; use day-of-month without padding via int()
+        start = f"{period.start.strftime('%b')} {period.start.day}"
+        end = f"{period.end.strftime('%b')} {period.end.day}"
+        print()
+        print(f"period {start} – {end}:")
+        print(f"  worked   {period.total_hours:>6.2f}h / {period.standard_hours:.2f}h standard")
+        if period.lack_of_hours:
+            print(f"  missing  {period.lack_of_hours:>6.2f}h")
+        if period.credit_hours:
+            print(f"  credit   {period.credit_hours:>6.2f}h")
+        if period.absence_hours:
+            print(f"  absence  {period.absence_hours:>6.2f}h")
     return 0
 
 

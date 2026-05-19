@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional
@@ -26,13 +26,6 @@ from .config import Config, session_path
 
 log = logging.getLogger(__name__)
 
-
-# The web UI uses a fixed client_id when calling /api/auth/login. It's the same
-# value across every captured session, so it appears to be a per-app constant
-# rather than a per-user / per-browser one.
-DEFAULT_CLIENT_ID = (
-    "ZWUyYzllNGUzYjlhZDAwNzBiYTgwN2ZjYjU2YWZiNDRhZDhiYTFkNmM5NTkzNzJlNDc1NzRkM2Y5OGFiODc0Nw"
-)
 
 LOCATION_TYPES = ("OFFICE", "HOME", "ABROAD", "FIELD")
 _LOCATION_ALIASES = {
@@ -59,16 +52,26 @@ class AuthenticationError(TimeclockError):
 
 @dataclass
 class Entry:
-    """A single time-clock session/entry."""
+    """A single time-clock session/entry.
+
+    ``absence_name`` is set for absence-style records (Vacation, Sick leave,
+    Public Holiday, …) instead of ``location``; for those entries the start
+    and end timestamps span the absence period (typically a full day).
+    """
 
     started_at: datetime
     ended_at: Optional[datetime]
     location: Optional[str]
     note: Optional[str] = None
+    absence_name: Optional[str] = None
 
     @property
     def is_open(self) -> bool:
-        return self.ended_at is None
+        return self.ended_at is None and self.absence_name is None
+
+    @property
+    def is_absence(self) -> bool:
+        return self.absence_name is not None
 
     @property
     def duration(self) -> timedelta:
@@ -76,10 +79,12 @@ class Entry:
         return end - self.started_at
 
     def format_line(self) -> str:
-        end_str = self.ended_at.strftime("%H:%M") if self.ended_at else "  …  "
         date_str = self.started_at.strftime("%a %Y-%m-%d")
         hours = self.duration.total_seconds() / 3600
-        loc = f" @ {self.location}" if self.location else ""
+        if self.is_absence:
+            return f"{date_str}  {' ' * 12}  {hours:>5.2f}h  ↳ {self.absence_name}"
+        end_str = self.ended_at.strftime("%H:%M") if self.ended_at else "  …  "
+        loc = f" @ {self.location.lower()}" if self.location else ""
         return f"{date_str}  {self.started_at.strftime('%H:%M')}–{end_str}  {hours:>5.2f}h{loc}"
 
 
@@ -94,14 +99,34 @@ class Status:
 
 
 @dataclass
+class PeriodSummary:
+    """Aggregate totals for the current payroll period."""
+
+    start: datetime
+    end: datetime
+    total_hours: float
+    standard_hours: float
+    credit_hours: float
+    lack_of_hours: float
+    absence_hours: float
+    days_worked: int
+    timezone: str
+
+
+@dataclass
 class _Session:
-    """On-disk cache of the auth response from ``/api/auth/check``."""
+    """On-disk cache of the auth response from ``/api/auth/check``.
+
+    ``company_id`` is fetched lazily on first list/report call and persisted
+    here so subsequent runs don't repeat the lookup.
+    """
 
     access_token: str
     expires_at: int           # unix timestamp
     refresh_token: str
     refresh_expires_at: int
     user_id: int
+    company_id: Optional[int] = None
 
     def is_expired(self, slack_seconds: int = 30) -> bool:
         return time.time() >= (self.expires_at - slack_seconds)
@@ -153,6 +178,73 @@ mutation makePunchDashboard($punch: InputWebPunch!) {
 }
 """
 
+# Minimal slice of currentUserContext to discover the user's company id.
+# Used once per session (cached in session.json) so we can plug it into the
+# DetailedAttendanceReport request.
+_GQL_USER_COMPANY = """
+query MeAndCompany {
+    currentUserContext {
+        user {
+            id
+            company { id }
+        }
+    }
+}
+"""
+
+# DetailedAttendanceReport — per-day attendance breakdown plus period totals.
+# Captured verbatim from the web UI then stripped down to the fields we use,
+# keeping the schema query name and variable shape intact.
+_GQL_DETAILED_REPORT = """
+query DetailedAttendanceReport(
+    $pageNumber: Int
+    $pageSize: Int
+    $reportSettings: InputReportSettings!
+) {
+    detailedAttendanceReport(
+        pageNumber: $pageNumber
+        pageSize: $pageSize
+        reportSettings: $reportSettings
+    ) {
+        elements {
+            startDate
+            endDate
+            timezone
+            totalDaysWorked
+            totalHours
+            totalLackOfHours
+            creditHours
+            totalStandardHours
+            totalAbsenceHours
+            user {
+                id
+                fullName
+                company { id name }
+            }
+            records {
+                date
+                weekDay
+                totalSeconds
+                standardSeconds
+                isWorkDay
+                allSessions {
+                    id
+                    startDate
+                    endDate
+                    activityLog { locationType }
+                }
+                allAbsenceTimes {
+                    absenceName
+                    seconds
+                    durationType
+                }
+            }
+        }
+        paginationInfo { pagesCount currentPageNumber pageSize }
+    }
+}
+"""
+
 
 class TimeclockClient:
     """Thin wrapper around ``requests.Session`` for timeclock365."""
@@ -188,7 +280,7 @@ class TimeclockClient:
         # --- step 1: /api/auth/login -----------------------------------------
         login_body = {
             "username": self.config.username,
-            "client_id": self.config.client_id or DEFAULT_CLIENT_ID,
+            "client_id": self.config.client_id,
         }
         r = self.http.post(
             f"{self.config.base_url}/api/auth/login",
@@ -289,18 +381,134 @@ class TimeclockClient:
         )
 
     def list_entries(self, days: int = 5) -> List[Entry]:
-        """List recent entries.
+        """Return recent punch sessions and absences, newest first.
 
-        Not yet implemented — we don't have a captured HAR for the timecard /
-        history view. To enable this, capture the request the timecard page
-        makes on load and share the operation name + query, then add it here.
+        ``days`` is the number of calendar days (inclusive of today) to report
+        on. Days with no activity are skipped. A day with two punch-in/out
+        sessions becomes two ``Entry`` objects.
         """
-        raise NotImplementedError(
-            "List flow not yet captured — open the Timecard page in the web UI, "
-            "export a HAR while it loads, and add the query to NOTES.md / client.py."
+        end_dt, start_dt = _window_for_days(days)
+        report = self._fetch_period_report(int(start_dt.timestamp()), int(end_dt.timestamp()))
+        entries: List[Entry] = []
+        for record in report.get("records", []):
+            for sess in record.get("allSessions") or []:
+                started = _parse_dt(sess.get("startDate"))
+                if started is None:
+                    continue
+                location = (sess.get("activityLog") or {}).get("locationType")
+                entries.append(Entry(
+                    started_at=started,
+                    ended_at=_parse_dt(sess.get("endDate")),
+                    location=location,
+                ))
+            for absence in record.get("allAbsenceTimes") or []:
+                day = _parse_dt(record.get("date"))
+                if day is None:
+                    continue
+                seconds = int(absence.get("seconds") or 0)
+                entries.append(Entry(
+                    started_at=day,
+                    ended_at=day + timedelta(seconds=seconds) if seconds else None,
+                    location=None,
+                    absence_name=absence.get("absenceName"),
+                ))
+        entries.sort(key=lambda e: e.started_at, reverse=True)
+        # Truncate to entries whose start falls inside the requested window —
+        # the API sometimes returns the whole payroll period regardless.
+        cutoff = start_dt
+        return [e for e in entries if e.started_at >= cutoff]
+
+    def period_summary(self) -> PeriodSummary:
+        """Aggregate totals for the current payroll period (server-defined)."""
+        end_dt, start_dt = _window_for_days(31)  # any window inside the period works
+        report = self._fetch_period_report(int(start_dt.timestamp()), int(end_dt.timestamp()))
+        return PeriodSummary(
+            start=_parse_dt(report.get("startDate")) or start_dt,
+            end=_parse_dt(report.get("endDate")) or end_dt,
+            total_hours=float(report.get("totalHours") or 0),
+            standard_hours=float(report.get("totalStandardHours") or 0),
+            credit_hours=float(report.get("creditHours") or 0),
+            lack_of_hours=float(report.get("totalLackOfHours") or 0),
+            absence_hours=float(report.get("totalAbsenceHours") or 0),
+            days_worked=int(report.get("totalDaysWorked") or 0),
+            timezone=str(report.get("timezone") or ""),
         )
 
     # ----- internals -----
+
+    def _fetch_period_report(self, start_ts: int, end_ts: int) -> dict:
+        """Run DetailedAttendanceReport and return the single element block."""
+        self.login()
+        company_id = self._ensure_company_id()
+        assert self._session is not None
+        variables = {
+            "pageNumber": 1,
+            "pageSize": 1,
+            "reportSettings": {
+                "userPickMode": "PICK_SELECT",
+                "startDateTs": start_ts,
+                "endDateTs": end_ts,
+                "companies": [company_id],
+                "companyBranches": [],
+                "groups": [],
+                "absences": [],
+                "contracts": [],
+                "users": [self._session.user_id],
+                "specifyPeriod": False,
+                "filterByAbsences": False,
+                "onlyAddedOrEditedHours": False,
+                "onlyEmptyDays": False,
+                "onlyExceptions": False,
+                "onlyEmptyEntries": False,
+                "onlyAutomaticPunchOut": False,
+                "notApprovedByEmployee": False,
+                "notApprovedByManager": False,
+                "includeTerminated": True,
+                "onlyTerminated": False,
+                "showOnlyDaysWithoutStandardHours": False,
+                "sortByUserFullName": False,
+                "weekDays": [],
+                "filterByWeekDays": False,
+                "showBonusColumn": False,
+                "showTravelDurationAndDistance": False,
+            },
+        }
+        log.info(
+            "Fetching DetailedAttendanceReport for %s … %s",
+            datetime.fromtimestamp(start_ts).strftime("%Y-%m-%d"),
+            datetime.fromtimestamp(end_ts).strftime("%Y-%m-%d"),
+        )
+        data = self._graphql(
+            _GQL_DETAILED_REPORT,
+            operation_name="DetailedAttendanceReport",
+            variables=variables,
+        )
+        elements = (data.get("detailedAttendanceReport") or {}).get("elements") or []
+        if not elements:
+            raise TimeclockError(
+                "DetailedAttendanceReport returned no elements — server may not have data for this period."
+            )
+        return elements[0]
+
+    def _ensure_company_id(self) -> int:
+        """Return the cached company_id, fetching it from the server if needed."""
+        assert self._session is not None
+        if self._session.company_id is not None:
+            return self._session.company_id
+        log.debug("Company id not cached — fetching via currentUserContext")
+        data = self._graphql(_GQL_USER_COMPANY, operation_name="MeAndCompany")
+        try:
+            company_id = int(data["currentUserContext"]["user"]["company"]["id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise TimeclockError(
+                f"Could not extract company id from currentUserContext response: {data}"
+            ) from exc
+        self._session.company_id = company_id
+        self._save_session()
+        log.debug("Cached company_id=%d", company_id)
+        return company_id
+
+
 
     def _make_punch(self, location: str, punch_type: str) -> Entry:
         self.login()
@@ -374,7 +582,10 @@ class TimeclockClient:
         try:
             with self.session_file.open("r", encoding="utf-8") as fh:
                 raw = json.load(fh)
-            return _Session(**raw)
+            # Tolerate unknown future fields and old caches missing newer ones.
+            known = {f for f in _Session.__dataclass_fields__}
+            cleaned = {k: v for k, v in raw.items() if k in known}
+            return _Session(**cleaned)
         except Exception as exc:  # noqa: BLE001 — best-effort cache load
             log.debug("Could not load cached session: %s", exc)
             return None
@@ -415,3 +626,19 @@ def _parse_dt(value: Optional[str]) -> Optional[datetime]:
         except ValueError:
             log.debug("Unparseable datetime from server: %r", value)
             return None
+
+
+def _window_for_days(days: int) -> tuple:
+    """Return ``(end_dt, start_dt)`` covering the last ``days`` calendar days.
+
+    The window is inclusive on both ends: today 00:00 through today 23:59:59 is
+    one day. Timestamps are local-time based since the report API interprets
+    timestamps in the user's timezone via the ``timezone`` field on the user.
+    """
+    days = max(1, int(days))
+    now = datetime.now()
+    end_dt = now.replace(hour=23, minute=59, second=59, microsecond=0)
+    start_dt = (now - timedelta(days=days - 1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    return end_dt, start_dt

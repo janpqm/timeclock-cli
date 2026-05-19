@@ -124,9 +124,74 @@ query DashboardWebPunchQuery {
 - `session != null && session.endDate == null` → currently punched in (since `session.startDate`)
 - `lunchSession` works the same way for lunch breaks
 
-## 5. List recent entries — NOT YET CAPTURED
+## 5. List recent entries / period summary — `DetailedAttendanceReport`
 
-We don't have a HAR for the timecard / history view. To finish `tc list`, capture a flow that shows multiple past punch sessions (probably the Timecard page, `/en/timecard` or similar). Expected operation name might be `MyTimesheetQuery` or similar; if so, paste its query and one response and we can wire it up.
+```graphql
+query DetailedAttendanceReport(
+    $pageNumber: Int
+    $pageSize: Int
+    $reportSettings: InputReportSettings!
+) {
+    detailedAttendanceReport(
+        pageNumber: $pageNumber
+        pageSize: $pageSize
+        reportSettings: $reportSettings
+    ) {
+        elements {
+            startDate endDate timezone
+            totalDaysWorked totalHours totalLackOfHours
+            creditHours totalStandardHours totalAbsenceHours
+            user { id fullName company { id name } }
+            records {
+                date weekDay totalSeconds standardSeconds isWorkDay
+                allSessions {
+                    id startDate endDate
+                    activityLog { locationType }
+                }
+                allAbsenceTimes { absenceName seconds durationType }
+            }
+        }
+    }
+}
+```
+
+Variables — most of these are filter toggles we just leave at their captured
+defaults. The dynamic bits are the timestamp window, the company id, and the
+user id.
+
+```json
+{
+    "pageNumber": 1, "pageSize": 1,
+    "reportSettings": {
+        "userPickMode": "PICK_SELECT",
+        "startDateTs": 1778803200, "endDateTs": 1781481599,
+        "companies": [10365], "users": [108697],
+        "companyBranches": [], "groups": [],
+        "absences": [], "contracts": [], "weekDays": [],
+        "specifyPeriod": false, "filterByAbsences": false,
+        "onlyAddedOrEditedHours": false, "onlyEmptyDays": false,
+        "onlyExceptions": false, "onlyEmptyEntries": false,
+        "onlyAutomaticPunchOut": false,
+        "notApprovedByEmployee": false, "notApprovedByManager": false,
+        "includeTerminated": true, "onlyTerminated": false,
+        "showOnlyDaysWithoutStandardHours": false,
+        "sortByUserFullName": false, "filterByWeekDays": false,
+        "showBonusColumn": false, "showTravelDurationAndDistance": false
+    }
+}
+```
+
+The response wraps everything as `{ code: 200, data: { detailedAttendanceReport: { elements: [<one block>] } } }`. The single element contains period totals plus a `records[]` array, one entry per calendar day. Each record's `allSessions[]` lists the day's punch sessions; `allAbsenceTimes[]` lists absences (Vacation, Sick leave, …).
+
+`startDateTs` / `endDateTs` are Unix timestamps. Use `companies` = [`user.company.id`] and `users` = [`user_id` from `/api/auth/check`]. We fetch and cache `company_id` via the small `MeAndCompany` query:
+
+```graphql
+query MeAndCompany {
+    currentUserContext {
+        user { id company { id } }
+    }
+}
+```
 
 ## Open questions / TODO
 
