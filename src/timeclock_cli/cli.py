@@ -17,6 +17,8 @@ import logging
 import sys
 from typing import List, Optional
 
+import requests.exceptions
+
 from . import __version__
 from .client import AuthenticationError, TimeclockClient, TimeclockError
 from .config import Config, load_config
@@ -74,26 +76,32 @@ def build_parser() -> argparse.ArgumentParser:
 def _cmd_status(client: TimeclockClient) -> int:
     status = client.status()
     if status.clocked_in:
-        when = status.since.strftime("%H:%M") if status.since else "?"
-        loc = f" at {status.location}" if status.location else ""
+        when = status.since.strftime("%a %H:%M") if status.since else "?"
+        loc = f" @ {status.location.lower()}" if status.location else ""
         print(f"clocked IN since {when}{loc}")
+        if status.today_total is not None:
+            hours = status.today_total.total_seconds() / 3600
+            print(f"running: {hours:.2f}h")
     else:
         print("clocked OUT")
-    if status.today_total is not None:
-        hours = status.today_total.total_seconds() / 3600
-        print(f"today: {hours:.2f}h")
+        if status.default_location:
+            print(f"default location: {status.default_location.lower()}")
     return 0
 
 
 def _cmd_in(client: TimeclockClient, location: Optional[str]) -> int:
-    client.punch_in(location)
-    print("punched in" + (f" at {location}" if location else ""))
+    entry = client.punch_in(location)
+    loc = (entry.location or "").lower()
+    when = entry.started_at.strftime("%H:%M") if entry.started_at else "?"
+    print(f"punched in @ {loc} at {when}")
     return 0
 
 
 def _cmd_out(client: TimeclockClient) -> int:
-    client.punch_out()
-    print("punched out")
+    entry = client.punch_out()
+    when = entry.ended_at.strftime("%H:%M") if entry.ended_at else "?"
+    hours = entry.duration.total_seconds() / 3600
+    print(f"punched out at {when} — {hours:.2f}h")
     return 0
 
 
@@ -151,6 +159,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         log.error("%s", exc)
         log.error("This part of the flow has not been captured yet — see NOTES.md.")
         return 4
+    except requests.exceptions.RequestException as exc:
+        log.error("Network error talking to %s: %s", config.base_url, exc)
+        return 5
     except TimeclockError as exc:
         log.error("timeclock error: %s", exc)
         return 1

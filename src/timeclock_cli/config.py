@@ -30,12 +30,17 @@ password =
 
 [defaults]
 # Optional default location for `tc in` when none is given on the command line.
-# Example: office, home, client-site
+# Allowed values: office, home, abroad, field (case-insensitive).
 location =
 
 [server]
 # Override only if you point at a self-hosted timeclock365 instance.
 base_url = https://live.timeclock365.com
+
+# Optional: override the client_id sent to /api/auth/login. Leave empty to use
+# the default value the web UI sends. Change only if /api/auth/login starts
+# rejecting requests and you've captured a new client_id from DevTools.
+client_id =
 """
 
 
@@ -46,6 +51,7 @@ class Config:
     base_url: str
     default_location: Optional[str]
     path: Path
+    client_id: Optional[str] = None
 
     def is_complete(self) -> bool:
         return bool(self.username and self.password)
@@ -98,6 +104,7 @@ def load_config(path: Optional[Path] = None) -> Config:
             base_url=DEFAULT_BASE_URL,
             default_location=None,
             path=cfg_path,
+            client_id=None,
         )
 
     parser = configparser.ConfigParser()
@@ -107,6 +114,7 @@ def load_config(path: Optional[Path] = None) -> Config:
     password = parser.get("auth", "password", fallback="").strip()
     base_url = parser.get("server", "base_url", fallback=DEFAULT_BASE_URL).strip() or DEFAULT_BASE_URL
     default_location = parser.get("defaults", "location", fallback="").strip() or None
+    client_id = parser.get("server", "client_id", fallback="").strip() or None
 
     # Warn about world-readable config (skip on Windows where mode bits are meaningless).
     if sys.platform != "win32":
@@ -125,4 +133,5 @@ def load_config(path: Optional[Path] = None) -> Config:
         base_url=base_url.rstrip("/"),
         default_location=default_location,
         path=cfg_path,
+        client_id=client_id,
     )
