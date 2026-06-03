@@ -53,9 +53,13 @@ def build_parser() -> argparse.ArgumentParser:
             "  tc in office             punch in at 'office', now\n"
             "  tc in 7:30               punch in retroactively at 07:30 today\n"
             "  tc in office 7:30        punch in at 'office', 07:30 today\n"
+            "  tc in home               update current session location to 'home'\n"
             "  tc out                   punch out, now\n"
+            "  tc out 16:00             update last punch-out time to 16:00\n"
             "  tc out 18:30 --force     punch out at 18:30 today, override safety check\n"
             "  tc list -n 14            list the last 14 days of entries\n"
+            "\n"
+            " Locations: (\"OFFICE\", \"HOME\", \"ABROAD\" or \"FIELD\")"
         ),
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")

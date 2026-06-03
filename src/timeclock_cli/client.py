@@ -85,6 +85,10 @@ class Entry:
     ``absence_name`` is set for absence-style records (Vacation, Sick leave,
     Public Holiday, …) instead of ``location``. ``is_lunch=True`` marks lunch
     break entries (no location either, just start/end times).
+
+    ``session_id`` and ``timezone_name`` are populated by ``_make_punch`` so
+    that callers can pass them straight to ``update_session`` without a second
+    round-trip.
     """
 
     started_at: datetime
@@ -93,6 +97,8 @@ class Entry:
     note: Optional[str] = None
     absence_name: Optional[str] = None
     is_lunch: bool = False
+    session_id: Optional[int] = None
+    timezone_name: Optional[str] = None
 
     @property
     def is_open(self) -> bool:
@@ -153,6 +159,7 @@ class Status:
     default_location: Optional[str] = None
     timezone_name: Optional[str] = None
     lunch: Optional[LunchBreak] = None
+    session_id: Optional[int] = None
 
 
 @dataclass
@@ -265,6 +272,14 @@ mutation makePunchDashboard($punch: InputWebPunch!) {
 }
 """
 
+_GQL_UPDATE_SESSION = """
+mutation updateSession($id: Int!, $session: InputActivityLog!) {
+    updateSession(id: $id, session: $session) {
+        id
+    }
+}
+"""
+
 # Minimal slice of currentUserContext to discover the user's company id.
 # Used once per session (cached in session.json) so we can plug it into the
 # DetailedAttendanceReport request.
@@ -316,6 +331,7 @@ query DetailedAttendanceReport(
                 isWorkDay
                 allSessions {
                     id
+                    activityLogId
                     startDate
                     endDate
                     activityLog {
@@ -451,42 +467,82 @@ class TimeclockClient:
 
         ``location`` accepts user-friendly forms (``office``, ``remote``, …).
         ``at`` optionally specifies a retroactive start time (tz-aware datetime).
-        ``force`` skips the "are you already punched in?" check and lets the
-        server reject the call if it disagrees.
+        ``force`` skips the "already punched in" check and lets the server reject.
+
+        When already clocked in and ``location`` or ``at`` is given, the open
+        session is updated in place instead of raising ConflictError.
         """
         loc = normalize_location(location or self.config.default_location)
-        if loc is None:
-            # Fall back to the server-side default location.
-            status = self.status()
-            loc = status.default_location or "OFFICE"
-            log.info("No location given; falling back to server default %s", loc)
 
         if not (force or self.config.force_overwrite):
             status = self.status()
             if status.clocked_in:
+                if location is not None or at is not None:
+                    update_loc = (
+                        normalize_location(location) if location is not None
+                        else (status.location or "OFFICE")
+                    )
+                    log.info("Already clocked in — updating open session (loc=%s)", update_loc)
+                    return self._update_open_session(status, update_loc, at)
                 raise ConflictError(
                     f"Already clocked in since {status.since.astimezone().strftime('%H:%M')} "
                     f"@ {status.location}. Pass --force to overwrite."
                 )
+            if loc is None:
+                loc = status.default_location or "OFFICE"
+                log.info("No location given; falling back to server default %s", loc)
+        elif loc is None:
+            status = self.status()
+            loc = status.default_location or "OFFICE"
+            log.info("No location given; falling back to server default %s", loc)
 
+        # InputWebPunch doesn't accept startDate; punch in now, then patch via updateSession.
         log.info("Punching in at %s%s", loc, f" (manual start={at:%H:%M})" if at else "")
-        return self._make_punch(loc, "PUNCH_IN", at=at)
+        entry = self._make_punch(loc, "PUNCH_IN")
+        if at is not None and entry.session_id is not None:
+            tz_name = entry.timezone_name or "UTC"
+            entry = self.update_session(
+                entry.session_id,
+                start_ts=_to_server_ts(at, tz_name),
+                end_ts=None,
+                location=loc,
+                date_str=at.strftime("%Y-%m-%d"),
+                timezone_name=tz_name,
+            )
+        return entry
 
     def punch_out(self, *, at: Optional[datetime] = None, force: bool = False) -> Entry:
-        """Punch out, with optional retroactive time and force flag."""
-        # Need the current session's location to send back to the server.
+        """Punch out, with optional retroactive time and force flag.
+
+        When already clocked out and ``at`` is given, the most recent session's
+        end time is updated in place instead of raising ConflictError.
+
+        Note: ``InputWebPunch`` does not accept ``endDate``, so a custom end
+        time is always applied via ``updateSession`` after the initial punch.
+        """
         status = self.status()
         loc = status.location or status.default_location or "OFFICE"
 
         if not (force or self.config.force_overwrite):
             if not status.clocked_in:
+                if at is not None:
+                    log.info("Already clocked out — updating last session end time")
+                    return self._update_last_session_end(at)
                 raise ConflictError(
                     "Not currently clocked in — nothing to punch out. "
                     "Pass --force to send the request anyway."
                 )
+        elif not status.clocked_in and at is not None:
+            log.info("Already clocked out (force) — updating last session end time")
+            return self._update_last_session_end(at)
 
+        # InputWebPunch doesn't accept endDate; punch out at current time,
+        # then patch the end time via updateSession if a custom time was given.
         log.info("Punching out (location=%s)%s", loc, f" (manual end={at:%H:%M})" if at else "")
-        return self._make_punch(loc, "PUNCH_OUT", at=at)
+        entry = self._make_punch(loc, "PUNCH_OUT")
+        if at is not None:
+            entry = self._update_last_session_end(at)
+        return entry
 
     def status(self) -> Status:
         log.debug("Fetching current status")
@@ -517,6 +573,7 @@ class TimeclockClient:
                     ended_at=_parse_utc(lunch_node.get("endDate")),
                 )
 
+        session_id = int(session["id"]) if session.get("id") else None
         return Status(
             clocked_in=clocked_in,
             since=since,
@@ -526,6 +583,7 @@ class TimeclockClient:
             default_location=wp.get("locationType"),
             timezone_name=tz_name,
             lunch=lunch,
+            session_id=session_id,
         )
 
     def list_entries(self, days: int = 5) -> List[Entry]:
@@ -595,6 +653,113 @@ class TimeclockClient:
             absence_hours=float(report.get("totalAbsenceHours") or 0),
             days_worked=int(report.get("totalDaysWorked") or 0),
             timezone=str(tz_name or ""),
+        )
+
+    def update_session(
+        self,
+        session_id: int,
+        *,
+        start_ts: int,
+        end_ts: Optional[int],
+        location: str,
+        date_str: str,
+        timezone_name: str,
+    ) -> Entry:
+        """Call the updateSession GraphQL mutation directly."""
+        self.login()
+        assert self._session is not None
+        variables = {
+            "id": session_id,
+            "session": {
+                "date": date_str,
+                "startDateTs": start_ts,
+                "endDateTs": end_ts,
+                "userId": self._session.user_id,
+                "locationType": location,
+                "timezone": timezone_name,
+            },
+        }
+        log.info("updateSession id=%d loc=%s start=%d end=%s", session_id, location, start_ts, end_ts)
+        data = self._graphql(
+            _GQL_UPDATE_SESSION,
+            operation_name="updateSession",
+            variables=variables,
+        )
+        node = data.get("updateSession")
+        if not node or not node.get("id"):
+            raise TimeclockError(f"updateSession returned unexpected response: {data}")
+        local_tz = _resolve_tz(timezone_name)
+        return Entry(
+            started_at=datetime.fromtimestamp(start_ts, tz=timezone.utc).replace(tzinfo=local_tz),
+            ended_at=datetime.fromtimestamp(end_ts, tz=timezone.utc).replace(tzinfo=local_tz) if end_ts else None,
+            location=location,
+        )
+
+    def _update_open_session(
+        self,
+        status: "Status",
+        new_location: str,
+        new_start: Optional[datetime],
+    ) -> Entry:
+        """Update the currently-open session's location and/or start time."""
+        if status.session_id is None:
+            raise TimeclockError("Cannot update session: session ID not available from status")
+        if status.since is None:
+            raise TimeclockError("Cannot update session: current session has no start time")
+        tz_name = status.timezone_name or "UTC"
+        tz_obj = _resolve_tz(tz_name)
+        start_ts = (
+            _to_server_ts(new_start, tz_name)
+            if new_start is not None
+            else _to_server_ts(status.since, tz_name)
+        )
+        date_str = status.since.astimezone(tz_obj).strftime("%Y-%m-%d")
+        return self.update_session(
+            status.session_id,
+            start_ts=start_ts,
+            end_ts=None,
+            location=new_location,
+            date_str=date_str,
+            timezone_name=tz_name,
+        )
+
+    def _update_last_session_end(self, new_end: datetime) -> Entry:
+        """Update the end time of today's most recent completed session."""
+        today_end, today_start = _window_for_days(1)
+        report = self._fetch_period_report(int(today_start.timestamp()), int(today_end.timestamp()))
+        tz_name = report.get("timezone")
+
+        last_sess: Optional[dict] = None
+        last_start_dt: Optional[datetime] = None
+        for record in report.get("records", []):
+            for sess in record.get("allSessions") or []:
+                if not sess.get("endDate"):
+                    continue
+                started = _parse_in_zone(sess.get("startDate"), tz_name)
+                if started and (last_start_dt is None or started > last_start_dt):
+                    last_sess = sess
+                    last_start_dt = started
+
+        if last_sess is None or last_start_dt is None:
+            raise TimeclockError("No completed session found today to update.")
+
+        raw_id = last_sess.get("activityLogId") or last_sess.get("id")
+        if not raw_id:
+            raise TimeclockError("Cannot update session: no ID found in report response.")
+        session_id = int(raw_id)
+        activity = last_sess.get("activityLog") or {}
+        location = activity.get("locationType") or "OFFICE"
+        start_ts = _to_server_ts(last_start_dt, tz_name)
+        end_ts = _to_server_ts(new_end, tz_name)
+        tz_obj = _resolve_tz(tz_name)
+        date_str = last_start_dt.astimezone(tz_obj).strftime("%Y-%m-%d")
+        return self.update_session(
+            session_id,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            location=location,
+            date_str=date_str,
+            timezone_name=tz_name or "UTC",
         )
 
     # ----- internals -----
@@ -727,6 +892,8 @@ class TimeclockClient:
             started_at=_parse_utc(node["startDate"]),
             ended_at=_parse_utc(node.get("endDate")),
             location=node.get("locationType"),
+            session_id=int(node["id"]) if node.get("id") else None,
+            timezone_name=node.get("timezone"),
         )
 
     def _graphql(
@@ -869,6 +1036,16 @@ def _now_aware(tz=None) -> datetime:
     if tz is None:
         return datetime.now().astimezone()
     return datetime.now(tz=tz)
+
+
+def _to_server_ts(dt: datetime, tz_name: Optional[str] = None) -> int:
+    """Convert a tz-aware datetime to the server's timestamp format.
+
+    The server's startDateTs/endDateTs fields expect epoch(local_time_as_UTC):
+    to store 08:22 CEST, send epoch(08:22 UTC). Verified from HAR captures.
+    """
+    local = dt.astimezone(_resolve_tz(tz_name))
+    return int(local.replace(tzinfo=timezone.utc).timestamp())
 
 
 def _window_for_days(days: int) -> Tuple[datetime, datetime]:
