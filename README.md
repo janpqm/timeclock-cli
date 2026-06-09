@@ -33,15 +33,15 @@ client_id        = ZWUyYzllNGUzYjlhZDAwNzBiYTgwN2ZjYjU2YWZi…
 
 Only `username` and `password` actually need editing — everything else is pre-filled with sensible defaults.
 
-| Key                | Default                                   | Meaning |
-| ------------------ | ----------------------------------------- | ------- |
-| `username`         | —                                         | timeclock365 login |
-| `password`         | —                                         | timeclock365 password |
-| `default_location` | `office`                                  | used by `tc in` when no location is given. One of `office`, `home`, `abroad`, `field`. Aliases like `remote` → `home` and `work` → `office` also work. |
-| `force_overwrite`  | `false`                                   | always overwrite the open session, even without `--force` |
-| `list_recent_last` | `true`                                    | `tc list` order: `true` = oldest first / newest last (tail-style), `false` = newest first |
-| `base_url`         | `https://live.timeclock365.com`           | override only if you have a self-hosted instance |
-| `client_id`        | (the stable web-UI value)                 | rotate here without a code change if timeclock365 ever changes it |
+| Key                | Default                         | Meaning                                                                                                                                                |
+|--------------------|---------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `username`         | —                               | timeclock365 login                                                                                                                                     |
+| `password`         | —                               | timeclock365 password                                                                                                                                  |
+| `default_location` | `office`                        | used by `tc in` when no location is given. One of `office`, `home`, `abroad`, `field`. Aliases like `remote` → `home` and `work` → `office` also work. |
+| `force_overwrite`  | `false`                         | always overwrite the open session, even without `--force`                                                                                              |
+| `list_recent_last` | `true`                          | `tc list` order: `true` = oldest first / newest last (tail-style), `false` = newest first                                                              |
+| `base_url`         | `https://live.timeclock365.com` | override only if you have a self-hosted instance                                                                                                       |
+| `client_id`        | (the stable web-UI value)       | rotate here without a code change if timeclock365 ever changes it                                                                                      |
 
 The file is created with mode `0600` (owner read/write only) so other users on the same machine cannot read your password.
 
@@ -62,7 +62,7 @@ tc list                     # last 5 days, oldest first (newest at the bottom)
 tc list -n 14               # last 14 days
 ```
 
-By default the CLI is quiet — only warnings and errors land on stderr. Pass `-v` for INFO-level progress messages (login, network calls), or set `TIMECLOCK_LOG=DEBUG` for full request/response detail.
+By default, the CLI is quiet — only warnings and errors land on stderr. Pass `-v` for INFO-level progress messages (login, network calls), or set `TIMECLOCK_LOG=DEBUG` for full request/response detail.
 
 ### `--force`
 
