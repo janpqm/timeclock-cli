@@ -280,6 +280,14 @@ mutation updateSession($id: Int!, $session: InputActivityLog!) {
 }
 """
 
+_GQL_CREATE_LUNCH = """
+mutation CreateLunch($lunch: InputLunch!) {
+    createLunch(lunch: $lunch) {
+        id
+    }
+}
+"""
+
 # Minimal slice of currentUserContext to discover the user's company id.
 # Used once per session (cached in session.json) so we can plug it into the
 # DetailedAttendanceReport request.
@@ -606,6 +614,8 @@ class TimeclockClient:
                     started_at=started,
                     ended_at=_parse_in_zone(sess.get("endDate"), tz_name),
                     location=activity.get("locationType"),
+                    session_id=int(sess["activityLogId"]) if sess.get("activityLogId") else None,
+                    timezone_name=tz_name,
                 ))
                 for lunch in activity.get("lunchSessions") or []:
                     lstart = _parse_in_zone(lunch.get("startDateInUserTimezone"), tz_name)
@@ -637,6 +647,71 @@ class TimeclockClient:
         recent_last = self.config.list_recent_last
         entries.sort(key=lambda e: e.started_at, reverse=not recent_last)
         return entries
+
+    def create_lunch(self, start_dt: datetime, end_dt: datetime) -> None:
+        """Record a completed lunch break on the work session that contains it.
+
+        Raises ``TimeclockError`` if no work session exists today or a lunch
+        break has already been recorded for today's session.
+        """
+        today = start_dt.astimezone().date()
+
+        # status() is the reliable source for session_id — it comes straight
+        # from the webPunch query which always returns the current session id.
+        # list_entries() is used only for the duplicate-lunch check.
+        status = self.status()
+        session_id: Optional[int] = status.session_id
+
+        if session_id is None:
+            # Punched out — find today's session id from list_entries.
+            entries = self.list_entries(days=1)
+            today_work = [
+                e for e in entries
+                if not e.is_lunch and not e.is_absence
+                and e.started_at.astimezone().date() == today
+            ]
+            if not today_work:
+                raise TimeclockError("No work session found for today — punch in first.")
+            session_id = today_work[0].session_id
+            if session_id is None:
+                raise TimeclockError("Could not determine today's session ID.")
+            # Duplicate check from full entry list.
+            today_lunch = [
+                e for e in entries
+                if e.is_lunch and e.started_at.astimezone().date() == today
+            ]
+        else:
+            # Currently punched in — duplicate check via list_entries.
+            entries = self.list_entries(days=1)
+            today_lunch = [
+                e for e in entries
+                if e.is_lunch and e.started_at.astimezone().date() == today
+            ]
+
+        if today_lunch:
+            existing = today_lunch[0]
+            end_str = existing.ended_at.astimezone().strftime("%H:%M") if existing.ended_at else "…"
+            raise TimeclockError(
+                f"Lunch break already recorded today "
+                f"({existing.started_at.astimezone().strftime('%H:%M')}–{end_str})."
+            )
+
+        start_utc = start_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_utc = end_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        log.info("CreateLunch session=%d %s – %s UTC", session_id, start_utc, end_utc)
+        self.login()
+        data = self._graphql(
+            _GQL_CREATE_LUNCH,
+            operation_name="CreateLunch",
+            variables={"lunch": {
+                "sessionId": session_id,
+                "startPunchDate": start_utc,
+                "endPunchDate": end_utc,
+            }},
+        )
+        node = data.get("createLunch")
+        if not node or not node.get("id"):
+            raise TimeclockError(f"createLunch returned unexpected response: {data}")
 
     def period_summary(self) -> PeriodSummary:
         """Aggregate totals for the current payroll period (server-defined)."""

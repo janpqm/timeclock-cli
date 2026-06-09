@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from datetime import timedelta
 from itertools import groupby
 from typing import List, Optional, Tuple
 
@@ -102,6 +103,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     sub.add_parser("status", help="show current status (default if no command given)")
+
+    p_break = sub.add_parser(
+        "break",
+        help="record today's lunch break",
+        description=(
+            "Record a lunch break.\n"
+            "  tc break               use default start time and duration from config\n"
+            "  tc break 11:00         start at 11:00, use default duration\n"
+            "  tc break 11:15 11:43   exact start and end times"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_break.add_argument(
+        "times",
+        nargs="*",
+        metavar="HH:MM",
+        help="start time, or start and end time",
+    )
 
     return parser
 
@@ -202,6 +221,37 @@ def _cmd_out(client: TimeclockClient, time_str: Optional[str], force: bool) -> i
     return 0
 
 
+def _cmd_break(client: TimeclockClient, times: List[str], config: Config) -> int:
+    if len(times) > 2:
+        raise TimeclockError("Too many arguments — expected at most two HH:MM times.")
+    for t in times:
+        if not looks_like_clock_time(t):
+            raise TimeclockError(f"Expected HH:MM, got {t!r}.")
+
+    if len(times) == 2:
+        start_dt = parse_clock_time(times[0], allow_future=False)
+        end_dt = parse_clock_time(times[1], allow_future=False)
+    elif len(times) == 1:
+        start_dt = parse_clock_time(times[0], allow_future=False)
+        end_dt = start_dt + timedelta(minutes=config.break_duration)
+    else:
+        start_dt = parse_clock_time(config.break_start, allow_future=False)
+        end_dt = start_dt + timedelta(minutes=config.break_duration)
+
+    if end_dt <= start_dt:
+        raise TimeclockError(
+            f"Break end ({end_dt.strftime('%H:%M')}) must be after start ({start_dt.strftime('%H:%M')})."
+        )
+
+    client.create_lunch(start_dt, end_dt)
+    duration_min = int((end_dt - start_dt).total_seconds() / 60)
+    print(
+        f"break recorded {start_dt.strftime('%H:%M')}–{end_dt.strftime('%H:%M')}"
+        f" ({duration_min} min)"
+    )
+    return 0
+
+
 def _cmd_list(client: TimeclockClient, days: int) -> int:
     entries = client.list_entries(days=days)
     if not entries:
@@ -268,6 +318,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             return _cmd_out(client, args.time, args.force)
         if command == "list":
             return _cmd_list(client, args.days)
+        if command == "break":
+            return _cmd_break(client, args.times, config)
         parser.error(f"unknown command: {command}")  # exits with code 2
         return 2  # unreachable, satisfies the type checker
     except AuthenticationError as exc:

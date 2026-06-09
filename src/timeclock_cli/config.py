@@ -56,6 +56,11 @@ force_overwrite  = false
 #                   false = newest first, oldest last.
 list_recent_last = true
 
+# Default lunch-break start time and duration for `tc break`.
+# `tc break` uses both; `tc break HH:MM` overrides the start time only.
+break_start    = 12:00
+break_duration = 30
+
 # Override only if you point at a self-hosted timeclock365 instance.
 base_url         = {DEFAULT_BASE_URL}
 
@@ -76,6 +81,8 @@ class Config:
     client_id: str = DEFAULT_CLIENT_ID
     force_overwrite: bool = False
     list_recent_last: bool = True
+    break_start: str = "12:00"
+    break_duration: int = 30
 
     def is_complete(self) -> bool:
         return bool(self.username and self.password)
@@ -172,6 +179,12 @@ def load_config(path: Optional[Path] = None) -> Config:
     client_id = _get(parser, (SECTION, "client_id"), ("server", "client_id")) or DEFAULT_CLIENT_ID
     force_overwrite = _to_bool(_get(parser, (SECTION, "force_overwrite")), default=False)
     list_recent_last = _to_bool(_get(parser, (SECTION, "list_recent_last")), default=True)
+    break_start = _get(parser, (SECTION, "break_start")) or "12:00"
+    _break_duration_raw = _get(parser, (SECTION, "break_duration"))
+    try:
+        break_duration = int(_break_duration_raw) if _break_duration_raw else 30
+    except ValueError:
+        break_duration = 30
 
     # Don't ignore obvious template placeholders — treat them as "not configured".
     if username in {"you@yourcompany.com", "your.email@example.com"}:
@@ -199,4 +212,6 @@ def load_config(path: Optional[Path] = None) -> Config:
         client_id=client_id,
         force_overwrite=force_overwrite,
         list_recent_last=list_recent_last,
+        break_start=break_start,
+        break_duration=break_duration,
     )
