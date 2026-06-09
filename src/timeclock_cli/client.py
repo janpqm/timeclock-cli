@@ -125,7 +125,7 @@ class Entry:
         end_str = self.ended_at.strftime("%H:%M") if self.ended_at else "  …  "
         if self.is_lunch:
             return f"{date_str}  {self.started_at.strftime('%H:%M')}–{end_str}  {hours:>5.2f}h  ↳ lunch break"
-        loc = f" @ {self.location.lower()}" if self.location else ""
+        loc = f" @ {self.location.lower():<12}" if self.location else " " * 9
         return f"{date_str}  {self.started_at.strftime('%H:%M')}–{end_str}  {hours:>5.2f}h{loc}"
 
 

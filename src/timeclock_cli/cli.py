@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from itertools import groupby
 from typing import List, Optional, Tuple
 
 import requests.exceptions
@@ -206,8 +207,28 @@ def _cmd_list(client: TimeclockClient, days: int) -> int:
     if not entries:
         print(f"no entries in the last {days} day(s)")
         return 0
-    for entry in entries:
-        print(entry.format_line())
+    groups = [
+        (date, list(day_entries))
+        for date, day_entries in groupby(
+            entries, key=lambda e: e.started_at.astimezone().date()
+        )
+    ]
+    for i, (_date, day_entries) in enumerate(groups):
+        work = [e for e in day_entries if not e.is_lunch and not e.is_absence]
+        lunch = [e for e in day_entries if e.is_lunch]
+        show_total = len(work) > 1 or (work and lunch)
+        total_suffix = ""
+        if show_total:
+            total_secs = (
+                sum(e.duration.total_seconds() for e in work)
+                - sum(e.duration.total_seconds() for e in lunch)
+            )
+            total_suffix = f" {total_secs / 3600:>5.2f}h/d"
+        for j, entry in enumerate(day_entries):
+            line = entry.format_line()
+            if show_total and j == len(day_entries) - 1:
+                line += total_suffix
+            print(line)
     return 0
 
 
