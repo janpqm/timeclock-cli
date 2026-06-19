@@ -61,6 +61,10 @@ list_recent_last = true
 break_start    = 12:00
 break_duration = 30
 
+# Default start and end times for `tc set` when no times are given.
+set_start = 09:00
+set_end   = 17:00
+
 # Override only if you point at a self-hosted timeclock365 instance.
 base_url         = {DEFAULT_BASE_URL}
 
@@ -83,6 +87,8 @@ class Config:
     list_recent_last: bool = True
     break_start: str = "12:00"
     break_duration: int = 30
+    set_start: str = "09:00"
+    set_end: str = "17:00"
 
     def is_complete(self) -> bool:
         return bool(self.username and self.password)
@@ -185,6 +191,8 @@ def load_config(path: Optional[Path] = None) -> Config:
         break_duration = int(_break_duration_raw) if _break_duration_raw else 30
     except ValueError:
         break_duration = 30
+    set_start = _get(parser, (SECTION, "set_start")) or "09:00"
+    set_end = _get(parser, (SECTION, "set_end")) or "17:00"
 
     # Don't ignore obvious template placeholders — treat them as "not configured".
     if username in {"you@yourcompany.com", "your.email@example.com"}:
@@ -214,4 +222,6 @@ def load_config(path: Optional[Path] = None) -> Config:
         list_recent_last=list_recent_last,
         break_start=break_start,
         break_duration=break_duration,
+        set_start=set_start,
+        set_end=set_end,
     )

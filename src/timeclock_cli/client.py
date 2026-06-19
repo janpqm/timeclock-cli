@@ -246,6 +246,21 @@ def parse_clock_time(s: str, *, allow_future: bool = False) -> datetime:
     return candidate
 
 
+def parse_clock_time_on_date(s: str, d) -> datetime:
+    """Parse ``HH:MM`` on a specific ``datetime.date``, returning a tz-aware datetime."""
+    from datetime import date as _date  # local import avoids shadowing the module-level name
+    m = _CLOCK_RE.match(s.strip() if s else "")
+    if not m:
+        raise TimeclockError(f"Expected HH:MM (e.g. 7:30 or 18:00), got {s!r}")
+    h, mn = int(m.group(1)), int(m.group(2))
+    if not (0 <= h <= 23 and 0 <= mn <= 59):
+        raise TimeclockError(f"Invalid clock time {s!r} — must be 0:00 … 23:59")
+    return datetime.now().astimezone().replace(
+        year=d.year, month=d.month, day=d.day,
+        hour=h, minute=mn, second=0, microsecond=0,
+    )
+
+
 # ---------------------------------------------------------------- the client
 
 
@@ -283,6 +298,14 @@ mutation updateSession($id: Int!, $session: InputActivityLog!) {
 _GQL_CREATE_LUNCH = """
 mutation CreateLunch($lunch: InputLunch!) {
     createLunch(lunch: $lunch) {
+        id
+    }
+}
+"""
+
+_GQL_CREATE_SESSION = """
+mutation createSession($session: InputActivityLog!) {
+    createSession(session: $session) {
         id
     }
 }
@@ -712,6 +735,106 @@ class TimeclockClient:
         node = data.get("createLunch")
         if not node or not node.get("id"):
             raise TimeclockError(f"createLunch returned unexpected response: {data}")
+
+    def set_day(
+        self,
+        date,
+        location: str,
+        time_pairs: List[Tuple[datetime, datetime]],
+        break_pair: Optional[Tuple[datetime, datetime]] = None,
+    ) -> None:
+        """Create sessions for a day. Raises TimeclockError if entries already exist."""
+        from datetime import date as _date  # avoid shadowing module name
+        local_tz = datetime.now().astimezone().tzinfo
+        start_of_day = datetime(date.year, date.month, date.day, 0, 0, 0, tzinfo=local_tz)
+        end_of_day = datetime(date.year, date.month, date.day, 23, 59, 59, tzinfo=local_tz)
+
+        try:
+            report = self._fetch_period_report(
+                int(start_of_day.timestamp()), int(end_of_day.timestamp())
+            )
+        except TimeclockError as exc:
+            if "no elements" in str(exc).lower():
+                report = {}
+            else:
+                raise
+
+        date_str = str(date)
+        tz_name = report.get("timezone") or "UTC"
+
+        for record in report.get("records", []):
+            rec_date = (record.get("date") or "")[:10]
+            if rec_date != date_str:
+                continue
+            sessions = record.get("allSessions") or []
+            absences = record.get("allAbsenceTimes") or []
+            if sessions:
+                raise TimeclockError(
+                    f"{date_str} already has {len(sessions)} session(s). "
+                    "Clear the day first before using `tc set`."
+                )
+            if absences:
+                names = ", ".join(a.get("absenceName", "?") for a in absences)
+                raise TimeclockError(
+                    f"{date_str} has absence entry ({names}). "
+                    "Clear the day first before using `tc set`."
+                )
+
+        first_session_id: Optional[int] = None
+        for i, (start_dt, end_dt) in enumerate(time_pairs):
+            session_id = self._create_session(date_str, start_dt, end_dt, location, tz_name)
+            if i == 0:
+                first_session_id = session_id
+
+        if break_pair is not None and first_session_id is not None:
+            b_start, b_end = break_pair
+            start_utc = b_start.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            end_utc = b_end.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            log.info("CreateLunch (set_day) session=%d %s – %s UTC", first_session_id, start_utc, end_utc)
+            self.login()
+            data = self._graphql(
+                _GQL_CREATE_LUNCH,
+                operation_name="CreateLunch",
+                variables={"lunch": {
+                    "sessionId": first_session_id,
+                    "startPunchDate": start_utc,
+                    "endPunchDate": end_utc,
+                }},
+            )
+            node = data.get("createLunch")
+            if not node or not node.get("id"):
+                raise TimeclockError(f"createLunch returned unexpected response: {data}")
+
+    def _create_session(
+        self,
+        date_str: str,
+        start_dt: datetime,
+        end_dt: datetime,
+        location: str,
+        timezone_name: str,
+    ) -> int:
+        """Call createSession mutation. Returns the new session id."""
+        self.login()
+        assert self._session is not None
+        variables = {
+            "session": {
+                "date": date_str,
+                "startDateTs": _to_server_ts(start_dt, timezone_name),
+                "endDateTs": _to_server_ts(end_dt, timezone_name),
+                "userId": self._session.user_id,
+                "locationType": location,
+                "timezone": timezone_name,
+            }
+        }
+        log.info(
+            "createSession %s %s–%s @ %s",
+            date_str, start_dt.strftime("%H:%M"), end_dt.strftime("%H:%M"), location,
+        )
+        data = self._graphql(_GQL_CREATE_SESSION, operation_name="createSession", variables=variables)
+        node = data.get("createSession")
+        if not node or not node.get("id"):
+            raise TimeclockError(f"createSession returned unexpected response: {data}")
+        return int(node["id"])
 
     def period_summary(self) -> PeriodSummary:
         """Aggregate totals for the current payroll period (server-defined)."""

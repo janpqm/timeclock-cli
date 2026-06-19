@@ -19,7 +19,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from datetime import timedelta
+from datetime import date, timedelta
 from itertools import groupby
 from typing import List, Optional, Tuple
 
@@ -35,6 +35,7 @@ from .client import (
     looks_like_clock_time,
     normalize_location,
     parse_clock_time,
+    parse_clock_time_on_date,
 )
 from .config import Config, load_config
 from .logging_setup import configure_logging
@@ -67,7 +68,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("-v", "--verbose", action="store_true", help="enable verbose logging")
 
-    sub = parser.add_subparsers(dest="command", metavar="{in,out,list,status}")
+    sub = parser.add_subparsers(dest="command", metavar="{in,out,set,list,status,break}")
 
     p_in = sub.add_parser("in", help="punch in")
     p_in.add_argument(
@@ -103,6 +104,40 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     sub.add_parser("status", help="show current status (default if no command given)")
+
+    p_set = sub.add_parser(
+        "set",
+        help="set a full day's punch record",
+        description=(
+            "Set punch records for a day (defaults to today).\n"
+            "  tc set                                       today, all defaults no break\n"
+            "  tc set -b                                    today, all defaults with break\n"
+            "  tc set 2026-06-18                            specific date, defaults no break\n"
+            "  tc set 2026-06-18 office 7:00 16:00          custom location and times\n"
+            "  tc set 2026-06-18 7:00 16:00 -b              with default break\n"
+            "  tc set 2026-06-18 7:00 16:00 -b 11:30 12:30  with explicit break\n"
+            "  tc set 2026-06-18 office 7:00 12:00 13:00 16:00  two sessions\n"
+            "\n"
+            "Fails if the day already has sessions or absences (clear those first).\n"
+            "Warns if any time is in the future.\n"
+            "Omitting date defaults to today. Location defaults to default_location in\n"
+            "config, times to set_start/set_end, break to break_start/break_duration."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_set.add_argument(
+        "args",
+        nargs="*",
+        metavar="[YYYY-MM-DD] [LOCATION] [HH:MM HH:MM ...]",
+        help="optional date, location, and/or start/end time pairs",
+    )
+    p_set.add_argument(
+        "-b", "--break",
+        nargs="*",
+        metavar="HH:MM",
+        dest="break_times",
+        help="break times; omit values to use config defaults (break_start/break_duration)",
+    )
 
     p_break = sub.add_parser(
         "break",
@@ -252,6 +287,104 @@ def _cmd_break(client: TimeclockClient, times: List[str], config: Config) -> int
     return 0
 
 
+def _parse_set_args(raw: List[str]) -> Tuple[Optional[str], List[Tuple[str, str]]]:
+    """Split ``tc set`` positional args into ``(location, [(start, end), ...])``.
+
+    Times must come in pairs. Location is the single non-time token, if any.
+    """
+    times = [a for a in raw if looks_like_clock_time(a)]
+    others = [a for a in raw if not looks_like_clock_time(a)]
+    if len(others) > 1:
+        raise TimeclockError(f"Unexpected extra argument(s): {others[1:]!r}")
+    if len(times) % 2 != 0:
+        raise TimeclockError(
+            f"Time arguments must come in pairs (start end). Got {len(times)} time(s)."
+        )
+    pairs = [(times[i], times[i + 1]) for i in range(0, len(times), 2)]
+    return (others[0] if others else None, pairs)
+
+
+def _cmd_set(
+    client: TimeclockClient,
+    raw_args: List[str],
+    break_times: Optional[List[str]],
+    config,
+) -> int:
+    # First positional is the date if it parses as YYYY-MM-DD; otherwise use today.
+    remaining = list(raw_args)
+    if remaining:
+        try:
+            target_date = date.fromisoformat(remaining[0])
+            remaining = remaining[1:]
+        except ValueError:
+            target_date = date.today()
+    else:
+        target_date = date.today()
+
+    location_raw, pair_strs = _parse_set_args(remaining)
+
+    location = normalize_location(location_raw or config.default_location or "OFFICE")
+
+    if not pair_strs:
+        pair_strs = [(config.set_start, config.set_end)]
+
+    from datetime import datetime as _dt
+    now = _dt.now().astimezone()
+
+    pairs = []
+    for start_s, end_s in pair_strs:
+        start_dt = parse_clock_time_on_date(start_s, target_date)
+        end_dt = parse_clock_time_on_date(end_s, target_date)
+        if end_dt <= start_dt:
+            raise TimeclockError(f"End time {end_s} must be after start {start_s}.")
+        if start_dt > now or end_dt > now:
+            print(f"warning: {target_date} {start_s}–{end_s} is in the future", file=sys.stderr)
+        pairs.append((start_dt, end_dt))
+
+    # break_times is None  → no break
+    # break_times is []    → use config defaults
+    # break_times is [s,e] → explicit times
+    break_pair = None
+    if break_times is not None:
+        if len(break_times) == 0:
+            b_start = parse_clock_time_on_date(config.break_start, target_date)
+            b_end = b_start + timedelta(minutes=config.break_duration)
+        elif len(break_times) == 2:
+            b_start = parse_clock_time_on_date(break_times[0], target_date)
+            b_end = parse_clock_time_on_date(break_times[1], target_date)
+        else:
+            raise TimeclockError(
+                f"-b expects 0 or 2 HH:MM values, got {len(break_times)}."
+            )
+        if b_end <= b_start:
+            raise TimeclockError(
+                f"Break end ({b_end.strftime('%H:%M')}) must be after start ({b_start.strftime('%H:%M')})."
+            )
+        if b_start > now or b_end > now:
+            print(
+                f"warning: break {b_start.strftime('%H:%M')}–{b_end.strftime('%H:%M')}"
+                f" on {target_date} is in the future",
+                file=sys.stderr,
+            )
+        break_pair = (b_start, b_end)
+
+    client.set_day(target_date, location, pairs, break_pair)
+
+    total_secs = sum((e - s).total_seconds() for s, e in pairs)
+    if break_pair:
+        total_secs -= (break_pair[1] - break_pair[0]).total_seconds()
+
+    sessions_str = " + ".join(
+        f"{s.strftime('%H:%M')}–{e.strftime('%H:%M')}" for s, e in pairs
+    )
+    line = f"set {target_date}: {sessions_str} @ {location.lower()}"
+    if break_pair:
+        line += f"  break {break_pair[0].strftime('%H:%M')}–{break_pair[1].strftime('%H:%M')}"
+    line += f"  ({total_secs / 3600:.2f}h)"
+    print(line)
+    return 0
+
+
 def _cmd_list(client: TimeclockClient, days: int) -> int:
     entries = client.list_entries(days=days)
     if not entries:
@@ -320,6 +453,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             return _cmd_list(client, args.days)
         if command == "break":
             return _cmd_break(client, args.times, config)
+        if command == "set":
+            return _cmd_set(client, args.args, args.break_times, config)
         parser.error(f"unknown command: {command}")  # exits with code 2
         return 2  # unreachable, satisfies the type checker
     except AuthenticationError as exc:
