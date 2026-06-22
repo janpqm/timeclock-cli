@@ -27,6 +27,10 @@ password         = your-password
 default_location = office
 force_overwrite  = false
 list_recent_last = true
+break_start      = 12:00
+break_duration   = 30
+set_start        = 09:00
+set_end          = 17:00
 base_url         = https://live.timeclock365.com
 client_id        = ZWUyYzllNGUzYjlhZDAwNzBiYTgwN2ZjYjU2YWZi…
 ```
@@ -40,6 +44,10 @@ Only `username` and `password` actually need editing — everything else is pre-
 | `default_location` | `office`                        | used by `tc in` when no location is given. One of `office`, `home`, `abroad`, `field`. Aliases like `remote` → `home` and `work` → `office` also work. |
 | `force_overwrite`  | `false`                         | always overwrite the open session, even without `--force`                                                                                              |
 | `list_recent_last` | `true`                          | `tc list` order: `true` = oldest first / newest last (tail-style), `false` = newest first                                                              |
+| `break_start`      | `12:00`                         | default lunch-break start for `tc break` and `tc set -b`                                                                                               |
+| `break_duration`   | `30`                            | default lunch-break length in minutes for `tc break` and `tc set -b`                                                                                   |
+| `set_start`        | `09:00`                         | default day start for `tc set` when no times are given                                                                                                 |
+| `set_end`          | `17:00`                         | default day end for `tc set` when no times are given                                                                                                   |
 | `base_url`         | `https://live.timeclock365.com` | override only if you have a self-hosted instance                                                                                                       |
 | `client_id`        | (the stable web-UI value)       | rotate here without a code change if timeclock365 ever changes it                                                                                      |
 
@@ -58,9 +66,27 @@ tc in office 7:30           # both — location and a manual time
 tc out                      # punch out, right now
 tc out 18:30                # punch out at 18:30 today
 tc out 18:30 --force        # … and ignore any "you're already out" check
+tc break                    # record today's lunch using config defaults
+tc break 11:00              # start at 11:00, default duration
+tc break 11:15 11:43        # exact start and end
+tc set                      # set today using all defaults, no break
+tc set -b                   # set today using all defaults, with default break
+tc set 2026-06-18           # set a specific date, defaults, no break
+tc set 2026-06-18 office 7:00 16:00          # custom location and times
+tc set 2026-06-18 7:00 16:00 -b              # with default break
+tc set 2026-06-18 7:00 16:00 -b 11:30 12:30  # with explicit break
+tc set 2026-06-18 office 7:00 12:00 13:00 16:00  # two sessions in one day
 tc list                     # last 5 days, oldest first (newest at the bottom)
 tc list -n 14               # last 14 days
 ```
+
+### `tc set` and `tc break`
+
+`tc break` records a lunch break on the current session. With no args it uses `break_start` + `break_duration`; one time overrides the start; two times set start and end exactly.
+
+`tc set` writes a full day's punch record. The date is optional (defaults to today). Location defaults to `default_location`, work times to `set_start`/`set_end`. Pass start/end times in pairs for multiple sessions. `-b` adds a break: bare `-b` uses `break_start`/`break_duration`, or pass two `HH:MM` values for an explicit break.
+
+`tc set` refuses to touch a day that already has sessions or absences — clear those in the web UI first. Any time in the future produces a warning.
 
 By default, the CLI is quiet — only warnings and errors land on stderr. Pass `-v` for INFO-level progress messages (login, network calls), or set `TIMECLOCK_LOG=DEBUG` for full request/response detail.
 
