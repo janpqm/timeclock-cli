@@ -19,7 +19,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime as _dt, timedelta
 from itertools import groupby
 from typing import List, Optional, Tuple
 
@@ -32,6 +32,7 @@ from .client import (
     LunchBreak,
     TimeclockClient,
     TimeclockError,
+    _period_window,
     looks_like_clock_time,
     normalize_location,
     parse_clock_time,
@@ -68,7 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("-v", "--verbose", action="store_true", help="enable verbose logging")
 
-    sub = parser.add_subparsers(dest="command", metavar="{in,out,set,list,status,break}")
+    sub = parser.add_subparsers(dest="command", metavar="{in,out,set,set-all,list,status,break}")
 
     p_in = sub.add_parser("in", help="punch in")
     p_in.add_argument(
@@ -137,6 +138,34 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="HH:MM",
         dest="break_times",
         help="break times; omit values to use config defaults (break_start/break_duration)",
+    )
+
+    p_set_all = sub.add_parser(
+        "set-all",
+        help="bulk-set all empty workdays in the period with defaults",
+        description=(
+            "Fill every empty workday in the current period (or previous period\n"
+            "if the current one started fewer than 5 days ago) with the default\n"
+            "start/end times from config (set_start / set_end).\n\n"
+            "Skips days that already have sessions or absences. Always asks for\n"
+            "confirmation before writing, showing a full plan of what will change.\n\n"
+            "  tc set-all           show plan, confirm, then set empty workdays\n"
+            "  tc set-all -b        same, include default lunch break each day\n"
+            "  tc set-all -f        no confirmation; print each addition as it goes\n"
+            "  tc set-all -f -b     force + breaks\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_set_all.add_argument(
+        "-b", "--break",
+        action="store_true",
+        dest="with_breaks",
+        help="add default break to every day being set (overrides set_breaks config)",
+    )
+    p_set_all.add_argument(
+        "-f", "--force",
+        action="store_true",
+        help="skip confirmation prompt; print each addition as it happens",
     )
 
     p_break = sub.add_parser(
@@ -341,6 +370,10 @@ def _cmd_set(
             print(f"warning: {target_date} {start_s}–{end_s} is in the future", file=sys.stderr)
         pairs.append((start_dt, end_dt))
 
+    # Honor set_breaks config: treat as if -b was passed when not explicitly given
+    if break_times is None and config.set_breaks:
+        break_times = []
+
     # break_times is None  → no break
     # break_times is []    → use config defaults
     # break_times is [s,e] → explicit times
@@ -382,6 +415,139 @@ def _cmd_set(
         line += f"  break {break_pair[0].strftime('%H:%M')}–{break_pair[1].strftime('%H:%M')}"
     line += f"  ({total_secs / 3600:.2f}h)"
     print(line)
+    return 0
+
+
+def _cmd_set_all(
+    client: TimeclockClient,
+    config: Config,
+    force: bool,
+    verbose: bool,
+    with_breaks: bool,
+) -> int:
+    today = date.today()
+    p_start, p_end = _period_window(config.period_start_day, today)
+
+    # If current period just started (<5 days in), fill the previous period instead
+    if (today - p_start).days < 5:
+        prev = p_start - timedelta(days=1)
+        p_start, p_end = _period_window(config.period_start_day, prev)
+
+    use_breaks = with_breaks or config.set_breaks
+
+    # Warn when set_start/set_end were not found in config.ini
+    if not (config.set_start_configured and config.set_end_configured) and not force:
+        print(
+            f"warning: set_start/set_end not configured in {config.path}\n"
+            f"  using built-in defaults: {config.set_start}–{config.set_end}",
+            file=sys.stderr,
+        )
+        answer = input("Continue with these defaults? [y/N] ").strip().lower()
+        if answer not in ("y", "yes"):
+            print("Aborted.")
+            return 1
+
+    # Fetch all records for the period in one API call
+    local_tz = _dt.now().astimezone().tzinfo
+    period_start_dt = _dt(p_start.year, p_start.month, p_start.day, 0, 0, 0, tzinfo=local_tz)
+    period_end_dt = _dt(p_end.year, p_end.month, p_end.day, 23, 59, 59, tzinfo=local_tz)
+    records = client.get_period_records(
+        int(period_start_dt.timestamp()), int(period_end_dt.timestamp())
+    )
+
+    location = normalize_location(config.default_location or "OFFICE")
+
+    # Pre-compute display strings for the plan
+    b_end_time = (_dt.strptime(config.break_start, "%H:%M") + timedelta(minutes=config.break_duration))
+    b_end_str = b_end_time.strftime("%H:%M")
+    break_label = f"  break {config.break_start}–{b_end_str}" if use_breaks else ""
+    work_secs = (
+        _dt.strptime(config.set_end, "%H:%M") - _dt.strptime(config.set_start, "%H:%M")
+    ).total_seconds()
+    if use_breaks:
+        work_secs -= config.break_duration * 60
+
+    # Build plan: (date, label, should_set)
+    plan = []
+    cur = p_start
+    while cur <= p_end:
+        if cur > today:
+            if verbose:
+                plan.append((cur, "skip – future date", False))
+            cur += timedelta(days=1)
+            continue
+        if cur.weekday() in config.skip_weekdays:
+            if verbose:
+                plan.append((cur, "skip – weekend", False))
+            cur += timedelta(days=1)
+            continue
+        date_str = str(cur)
+        record = records.get(date_str, {})
+        sessions = record.get("allSessions") or []
+        absences = record.get("allAbsenceTimes") or []
+        if sessions or absences:
+            parts = []
+            if sessions:
+                parts.append(f"{len(sessions)} session(s)")
+            if absences:
+                names = ", ".join(a.get("absenceName", "?") for a in absences)
+                parts.append(f"absence: {names}")
+            plan.append((cur, f"nothing to add – already has {', '.join(parts)}", False))
+        else:
+            plan.append((
+                cur,
+                f"set {config.set_start}–{config.set_end} @ {location.lower()}{break_label}  ({work_secs / 3600:.2f}h)",
+                True,
+            ))
+        cur += timedelta(days=1)
+
+    to_set = [(d, lbl) for d, lbl, s in plan if s]
+
+    if not force:
+        print(f"Period: {p_start} … {p_end}\n")
+        for d, label, should_set in plan:
+            marker = "+" if should_set else " "
+            print(f"  [{marker}] {d.strftime('%a %Y-%m-%d')}  {label}")
+        skip_count = len([x for x, _, s in plan if not s])
+        print(f"\n{len(to_set)} day(s) to set, {skip_count} skipped")
+        if not to_set:
+            print("Nothing to do.")
+            return 0
+        answer = input("\nProceed? [y/N] ").strip().lower()
+        if answer not in ("y", "yes"):
+            print("Aborted.")
+            return 1
+
+    # Execute
+    ok = 0
+    for target_date, _ in to_set:
+        start_dt = parse_clock_time_on_date(config.set_start, target_date)
+        end_dt = parse_clock_time_on_date(config.set_end, target_date)
+
+        break_pair = None
+        if use_breaks:
+            b_start = parse_clock_time_on_date(config.break_start, target_date)
+            b_end = b_start + timedelta(minutes=config.break_duration)
+            break_pair = (b_start, b_end)
+
+        try:
+            client.set_day(target_date, location, [(start_dt, end_dt)], break_pair)
+            ok += 1
+            if force or verbose:
+                line = f"set {target_date}: {config.set_start}–{config.set_end} @ {location.lower()}"
+                if break_pair:
+                    line += f"  break {config.break_start}–{b_end_str}"
+                line += f"  ({work_secs / 3600:.2f}h)"
+                print(line)
+        except TimeclockError as exc:
+            msg = str(exc)
+            if "already has" in msg or "absence entry" in msg:
+                if verbose:
+                    print(f"skip {target_date}: {exc}", file=sys.stderr)
+            else:
+                raise
+
+    print(f"\nDone. Set {ok} day(s).")
     return 0
 
 
@@ -455,6 +621,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             return _cmd_break(client, args.times, config)
         if command == "set":
             return _cmd_set(client, args.args, args.break_times, config)
+        if command == "set-all":
+            return _cmd_set_all(client, config, args.force, args.verbose, args.with_breaks)
         parser.error(f"unknown command: {command}")  # exits with code 2
         return 2  # unreachable, satisfies the type checker
     except AuthenticationError as exc:

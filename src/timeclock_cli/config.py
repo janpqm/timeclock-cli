@@ -16,9 +16,9 @@ import logging
 import os
 import stat
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 
 log = logging.getLogger(__name__)
@@ -61,9 +61,15 @@ list_recent_last = true
 break_start    = 12:00
 break_duration = 30
 
-# Default start and end times for `tc set` when no times are given.
+# Default start and end times for `tc set` / `tc set-all` when no times are given.
 set_start = 09:00
 set_end   = 17:00
+
+# When true, `tc set` and `tc set-all` always include a break (same as passing -b).
+set_breaks = false
+
+# Days of the week to skip in `tc set-all` (0=Mon 1=Tue … 5=Sat 6=Sun).
+skip_weekdays = 5,6
 
 # Day of month the payroll period starts on (1–28). The period shown by
 # `tc status` runs from this day through the day before it next month.
@@ -95,6 +101,10 @@ class Config:
     set_start: str = "09:00"
     set_end: str = "17:00"
     period_start_day: int = 15
+    set_breaks: bool = False
+    skip_weekdays: List[int] = field(default_factory=lambda: [5, 6])
+    set_start_configured: bool = False
+    set_end_configured: bool = False
 
     def is_complete(self) -> bool:
         return bool(self.username and self.password)
@@ -197,8 +207,18 @@ def load_config(path: Optional[Path] = None) -> Config:
         break_duration = int(_break_duration_raw) if _break_duration_raw else 30
     except ValueError:
         break_duration = 30
-    set_start = _get(parser, (SECTION, "set_start")) or "09:00"
-    set_end = _get(parser, (SECTION, "set_end")) or "17:00"
+    _set_start_raw = _get(parser, (SECTION, "set_start"))
+    set_start = _set_start_raw or "09:00"
+    set_start_configured = bool(_set_start_raw)
+    _set_end_raw = _get(parser, (SECTION, "set_end"))
+    set_end = _set_end_raw or "17:00"
+    set_end_configured = bool(_set_end_raw)
+    set_breaks = _to_bool(_get(parser, (SECTION, "set_breaks")), default=False)
+    _skip_raw = _get(parser, (SECTION, "skip_weekdays"))
+    if _skip_raw:
+        skip_weekdays = [int(d.strip()) for d in _skip_raw.split(",") if d.strip().isdigit()]
+    else:
+        skip_weekdays = [5, 6]
     _period_start_raw = _get(parser, (SECTION, "period_start_day"))
     try:
         period_start_day = int(_period_start_raw) if _period_start_raw else 15
@@ -237,4 +257,8 @@ def load_config(path: Optional[Path] = None) -> Config:
         set_start=set_start,
         set_end=set_end,
         period_start_day=period_start_day,
+        set_breaks=set_breaks,
+        skip_weekdays=skip_weekdays,
+        set_start_configured=set_start_configured,
+        set_end_configured=set_end_configured,
     )

@@ -805,6 +805,21 @@ class TimeclockClient:
             if not node or not node.get("id"):
                 raise TimeclockError(f"createLunch returned unexpected response: {data}")
 
+    def get_period_records(self, start_ts: int, end_ts: int) -> dict:
+        """Return per-day records keyed by date string (YYYY-MM-DD) for the given window."""
+        try:
+            report = self._fetch_period_report(start_ts, end_ts)
+        except TimeclockError as exc:
+            if "no elements" in str(exc).lower():
+                return {}
+            raise
+        result = {}
+        for record in report.get("records", []):
+            date_str = (record.get("date") or "")[:10]
+            if date_str:
+                result[date_str] = record
+        return result
+
     def _create_session(
         self,
         date_str: str,
