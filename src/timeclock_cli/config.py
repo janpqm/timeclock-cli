@@ -65,6 +65,11 @@ break_duration = 30
 set_start = 09:00
 set_end   = 17:00
 
+# Day of month the payroll period starts on (1–28). The period shown by
+# `tc status` runs from this day through the day before it next month.
+# Example: 15 → Jun 15 … Jul 14. Set to 1 for calendar-month periods.
+period_start_day = 15
+
 # Override only if you point at a self-hosted timeclock365 instance.
 base_url         = {DEFAULT_BASE_URL}
 
@@ -89,6 +94,7 @@ class Config:
     break_duration: int = 30
     set_start: str = "09:00"
     set_end: str = "17:00"
+    period_start_day: int = 15
 
     def is_complete(self) -> bool:
         return bool(self.username and self.password)
@@ -193,6 +199,12 @@ def load_config(path: Optional[Path] = None) -> Config:
         break_duration = 30
     set_start = _get(parser, (SECTION, "set_start")) or "09:00"
     set_end = _get(parser, (SECTION, "set_end")) or "17:00"
+    _period_start_raw = _get(parser, (SECTION, "period_start_day"))
+    try:
+        period_start_day = int(_period_start_raw) if _period_start_raw else 15
+    except ValueError:
+        period_start_day = 15
+    period_start_day = max(1, min(28, period_start_day))
 
     # Don't ignore obvious template placeholders — treat them as "not configured".
     if username in {"you@yourcompany.com", "your.email@example.com"}:
@@ -224,4 +236,5 @@ def load_config(path: Optional[Path] = None) -> Config:
         break_duration=break_duration,
         set_start=set_start,
         set_end=set_end,
+        period_start_day=period_start_day,
     )

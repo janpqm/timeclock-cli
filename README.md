@@ -31,6 +31,7 @@ break_start      = 12:00
 break_duration   = 30
 set_start        = 09:00
 set_end          = 17:00
+period_start_day = 15
 base_url         = https://live.timeclock365.com
 client_id        = ZWUyYzllNGUzYjlhZDAwNzBiYTgwN2ZjYjU2YWZi…
 ```
@@ -48,6 +49,7 @@ Only `username` and `password` actually need editing — everything else is pre-
 | `break_duration`   | `30`                            | default lunch-break length in minutes for `tc break` and `tc set -b`                                                                                   |
 | `set_start`        | `09:00`                         | default day start for `tc set` when no times are given                                                                                                 |
 | `set_end`          | `17:00`                         | default day end for `tc set` when no times are given                                                                                                   |
+| `period_start_day` | `15`                            | day of month the payroll period starts (1–28). Period runs this day → day before it next month. Drives all `tc status` totals.                         |
 | `base_url`         | `https://live.timeclock365.com` | override only if you have a self-hosted instance                                                                                                       |
 | `client_id`        | (the stable web-UI value)       | rotate here without a code change if timeclock365 ever changes it                                                                                      |
 
@@ -87,6 +89,14 @@ tc list -n 14               # last 14 days
 `tc set` writes a full day's punch record. The date is optional (defaults to today). Location defaults to `default_location`, work times to `set_start`/`set_end`. Pass start/end times in pairs for multiple sessions. `-b` adds a break: bare `-b` uses `break_start`/`break_duration`, or pass two `HH:MM` values for an explicit break.
 
 `tc set` refuses to touch a day that already has sessions or absences — clear those in the web UI first. Any time in the future produces a warning.
+
+### Payroll period
+
+The totals shown by `tc status` are computed for your company's payroll period, not the calendar month. The period is defined locally by `period_start_day` (default `15`) and runs from that day through the day before it next month — e.g. with `15`, the June period is Jun 15 – Jul 14. Set `period_start_day = 1` for calendar-month periods.
+
+All period values (worked / standard / credit / missing / absence) are summed by the CLI from the per-day records inside that window, so they always match the configured period regardless of how the server groups its own period. Standard hours are counted only up to today, so "missing" reflects the shortfall so far — not the requirement for the whole period.
+
+### Logging
 
 By default, the CLI is quiet — only warnings and errors land on stderr. Pass `-v` for INFO-level progress messages (login, network calls), or set `TIMECLOCK_LOG=DEBUG` for full request/response detail.
 

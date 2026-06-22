@@ -837,19 +837,57 @@ class TimeclockClient:
         return int(node["id"])
 
     def period_summary(self) -> PeriodSummary:
-        """Aggregate totals for the current payroll period (server-defined)."""
-        end_dt, start_dt = _window_for_days(31)  # any window inside the period works
+        """Aggregate totals for the company payroll period.
+
+        The period boundaries are computed locally from
+        ``config.period_start_day`` (default 15 → the 15th through the 14th of
+        the next month) rather than trusting the server's own period grouping,
+        which often doesn't match the company's cycle. All totals are summed
+        from the per-day ``records`` so they always reflect the configured
+        window. Standard hours are counted only up to today, so "missing"
+        reflects the shortfall so far rather than for the whole period.
+        """
+        local_tz = datetime.now().astimezone().tzinfo
+        today = datetime.now().astimezone().date()
+        p_start, p_end = _period_window(self.config.period_start_day, today)
+
+        start_dt = datetime(p_start.year, p_start.month, p_start.day, 0, 0, 0, tzinfo=local_tz)
+        end_dt = datetime(p_end.year, p_end.month, p_end.day, 23, 59, 59, tzinfo=local_tz)
         report = self._fetch_period_report(int(start_dt.timestamp()), int(end_dt.timestamp()))
         tz_name = report.get("timezone")
+
+        total_secs = 0.0
+        standard_secs = 0.0
+        absence_secs = 0.0
+        days_worked = 0
+        for record in report.get("records", []):
+            rec_dt = _parse_in_zone(record.get("date"), tz_name)
+            if rec_dt is None:
+                continue
+            rec_date = rec_dt.date()
+            if rec_date < p_start or rec_date > p_end or rec_date > today:
+                continue
+            worked = float(record.get("totalSeconds") or 0)
+            total_secs += worked
+            standard_secs += float(record.get("standardSeconds") or 0)
+            for absence in record.get("allAbsenceTimes") or []:
+                absence_secs += float(absence.get("seconds") or 0)
+            if worked > 0:
+                days_worked += 1
+
+        # Running balance for the period so far: time worked plus paid absence
+        # against the standard required up to today.
+        net_secs = total_secs + absence_secs - standard_secs
+
         return PeriodSummary(
-            start=_parse_in_zone(report.get("startDate"), tz_name) or start_dt.astimezone(),
-            end=_parse_in_zone(report.get("endDate"), tz_name) or end_dt.astimezone(),
-            total_hours=float(report.get("totalHours") or 0),
-            standard_hours=float(report.get("totalStandardHours") or 0),
-            credit_hours=float(report.get("creditHours") or 0),
-            lack_of_hours=float(report.get("totalLackOfHours") or 0),
-            absence_hours=float(report.get("totalAbsenceHours") or 0),
-            days_worked=int(report.get("totalDaysWorked") or 0),
+            start=start_dt,
+            end=end_dt,
+            total_hours=total_secs / 3600,
+            standard_hours=standard_secs / 3600,
+            credit_hours=max(net_secs, 0.0) / 3600,
+            lack_of_hours=max(-net_secs, 0.0) / 3600,
+            absence_hours=absence_secs / 3600,
+            days_worked=days_worked,
             timezone=str(tz_name or ""),
         )
 
@@ -1244,6 +1282,33 @@ def _to_server_ts(dt: datetime, tz_name: Optional[str] = None) -> int:
     """
     local = dt.astimezone(_resolve_tz(tz_name))
     return int(local.replace(tzinfo=timezone.utc).timestamp())
+
+
+def _period_window(start_day: int, today):
+    """Return ``(period_start, period_end)`` dates for the period containing ``today``.
+
+    A period runs from ``start_day`` of one month through the day before
+    ``start_day`` of the next month (inclusive). ``start_day`` is clamped to
+    1–28 to stay valid in every month.
+    """
+    from datetime import date as _date
+
+    start_day = max(1, min(28, int(start_day)))
+    if today.day >= start_day:
+        p_start = today.replace(day=start_day)
+    else:
+        # Period started last month.
+        if today.month == 1:
+            p_start = _date(today.year - 1, 12, start_day)
+        else:
+            p_start = _date(today.year, today.month - 1, start_day)
+    # End = day before the next period's start.
+    if p_start.month == 12:
+        next_start = _date(p_start.year + 1, 1, start_day)
+    else:
+        next_start = _date(p_start.year, p_start.month + 1, start_day)
+    p_end = next_start - timedelta(days=1)
+    return p_start, p_end
 
 
 def _window_for_days(days: int) -> Tuple[datetime, datetime]:
