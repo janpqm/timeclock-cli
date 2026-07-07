@@ -1,11 +1,11 @@
 """Command-line entry point.
 
 Usage:
-    tc                       → status (default)
-    tc status                → status
-    tc in [location] [HH:MM] → punch in (optionally retroactive)
-    tc out [HH:MM]           → punch out (optionally retroactive)
-    tc list [-n DAYS]        → list recent entries
+    tc                          → status (default)
+    tc status                   → status
+    tc in [location] [HH:MM]    → punch in (optionally retroactive)
+    tc out [HH:MM]              → punch out (optionally retroactive)
+    tc list [-n DAYS] [--excel] → list recent entries
     tc --version
     tc --help
 
@@ -102,6 +102,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=5,
         help="number of days to show (default: 5)",
+    )
+    p_list.add_argument(
+        "--excel",
+        action="store_true",
+        help=(
+            "spreadsheet-friendly output: one line per day (oldest first), "
+            "first start and last end separated by a tab; days without a "
+            "punch (weekend, vacation, refresh, …) are empty lines"
+        ),
     )
 
     sub.add_parser("status", help="show current status (default if no command given)")
@@ -551,6 +560,35 @@ def _cmd_set_all(
     return 0
 
 
+def _cmd_list_excel(client: TimeclockClient, days: int) -> int:
+    """Spreadsheet-friendly listing: one line per calendar day, oldest first.
+
+    Days with work punches print ``<first start>\\t<last end>``; days without
+    any punch (weekend, vacation, refresh, …) print an empty line so the block
+    pastes into a spreadsheet column with dates staying aligned.
+    """
+    entries = client.list_entries(days=days)
+    work_by_day: dict = {}
+    for e in entries:
+        if e.is_lunch or e.is_absence:
+            continue
+        work_by_day.setdefault(e.started_at.astimezone().date(), []).append(e)
+
+    today = date.today()
+    cur = today - timedelta(days=max(1, days) - 1)
+    while cur <= today:
+        work = work_by_day.get(cur)
+        if work:
+            first = min(e.started_at for e in work).astimezone().strftime("%H:%M")
+            ends = [e.ended_at for e in work if e.ended_at is not None]
+            last = max(ends).astimezone().strftime("%H:%M") if ends else ""
+            print(f"{first}\t{last}")
+        else:
+            print()
+        cur += timedelta(days=1)
+    return 0
+
+
 def _cmd_list(client: TimeclockClient, days: int) -> int:
     entries = client.list_entries(days=days)
     if not entries:
@@ -616,6 +654,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         if command == "out":
             return _cmd_out(client, args.time, args.force)
         if command == "list":
+            if args.excel:
+                return _cmd_list_excel(client, args.days)
             return _cmd_list(client, args.days)
         if command == "break":
             return _cmd_break(client, args.times, config)
