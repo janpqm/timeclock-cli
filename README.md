@@ -35,7 +35,6 @@ set_breaks       = false
 skip_weekdays    = 5,6
 period_start_day = 15
 base_url         = https://live.timeclock365.com
-client_id        = ZWUyYzllNGUzYjlhZDAwNzBiYTgwN2ZjYjU2YWZi…
 ```
 
 Only `username` and `password` actually need editing — everything else is pre-filled with sensible defaults.
@@ -49,13 +48,13 @@ Only `username` and `password` actually need editing — everything else is pre-
 | `list_recent_last` | `true`                          | `tc list` order: `true` = oldest first / newest last (tail-style), `false` = newest first                                                              |
 | `break_start`      | `12:00`                         | default lunch-break start for `tc break` and `tc set -b`                                                                                               |
 | `break_duration`   | `30`                            | default lunch-break length in minutes for `tc break` and `tc set -b`                                                                                   |
-| `set_start`        | `09:00`                         | default day start for `tc set` / `tc set-all` when no times are given                                                                                 |
-| `set_end`          | `17:00`                         | default day end for `tc set` / `tc set-all` when no times are given                                                                                   |
+| `set_start`        | `09:00`                         | default day start for `tc set` / `tc set-all` when no times are given                                                                                  |
+| `set_end`          | `17:00`                         | default day end for `tc set` / `tc set-all` when no times are given                                                                                    |
 | `set_breaks`       | `false`                         | when `true`, `tc set` and `tc set-all` always include a break — same as passing `-b` every time                                                        |
 | `skip_weekdays`    | `5,6`                           | comma-separated weekday numbers to skip in `tc set-all` (0 = Mon … 6 = Sun). Default skips Saturday and Sunday.                                        |
 | `period_start_day` | `15`                            | day of month the payroll period starts (1–28). Period runs this day → day before it next month. Drives all `tc status` totals.                         |
 | `base_url`         | `https://live.timeclock365.com` | override only if you have a self-hosted instance                                                                                                       |
-| `client_id`        | (the stable web-UI value)       | rotate here without a code change if timeclock365 ever changes it                                                                                      |
+| `client_id`        | (the stable web-UI value)       | **Optional** pre-shared secred from the webUI. set here if the if timeclock365 ever changes the hardcoded value                                        |
 
 The file is created with mode `0600` (owner read/write only) so other users on the same machine cannot read your password.
 
@@ -78,9 +77,9 @@ tc break 11:15 11:43        # exact start and end
 tc set                      # set today using all defaults, no break
 tc set -b                   # set today using all defaults, with default break
 tc set 2026-06-18           # set a specific date, defaults, no break
-tc set 2026-06-18 office 7:00 16:00          # custom location and times
-tc set 2026-06-18 7:00 16:00 -b              # with default break
-tc set 2026-06-18 7:00 16:00 -b 11:30 12:30  # with explicit break
+tc set 2026-06-18 office 7:00 16:00              # custom location and times
+tc set 2026-06-18 7:00 16:00 -b                  # with default break
+tc set 2026-06-18 7:00 16:00 -b 11:30 12:30      # with explicit break
 tc set 2026-06-18 office 7:00 12:00 13:00 16:00  # two sessions in one day
 tc set-all                  # fill all empty workdays in the period, review plan first
 tc set-all -b               # same, add default lunch break to each day
