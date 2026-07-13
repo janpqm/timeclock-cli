@@ -502,6 +502,13 @@ def _cmd_set_all(
                 names = ", ".join(a.get("absenceName", "?") for a in absences)
                 parts.append(f"absence: {names}")
             plan.append((cur, f"nothing to add – already has {', '.join(parts)}", False))
+        elif cur == today and _dt.now().strftime("%H:%M") < config.set_end:
+            print(
+                f"warning: skip {cur} – set_end ({config.set_end}) is in the future",
+                file=sys.stderr,
+            )
+            if verbose:
+                plan.append((cur, "skip – set_end is in the future", False))
         else:
             plan.append((
                 cur,
