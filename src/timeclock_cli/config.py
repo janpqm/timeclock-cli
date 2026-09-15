@@ -15,6 +15,7 @@ import configparser
 import logging
 import os
 import stat
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,6 +26,8 @@ log = logging.getLogger(__name__)
 
 SECTION = "timeclock"
 DEFAULT_BASE_URL = "https://live.timeclock365.com"
+# macOS Keychain service name used when the config carries no password.
+KEYCHAIN_SERVICE = "timeclock365"
 
 # Stable per-app constant the web UI sends as `client_id` to /api/auth/login.
 # It's the same value across every captured session. If timeclock365 ever
@@ -42,6 +45,9 @@ _TEMPLATE = f"""\
 [timeclock]
 # Your timeclock365 login.
 username         = you@yourcompany.com
+# On macOS you can leave `password` empty and store it in the Keychain instead:
+#   security add-generic-password -a <username> -s timeclock365 -w -U
+# A value set here takes precedence over the Keychain.
 password         = your-password
 
 # Default location for `tc in` when none is given on the command line.
@@ -168,6 +174,38 @@ def _get(parser: configparser.ConfigParser, *candidates) -> str:
     return ""
 
 
+def _password_from_keychain(username: str) -> str:
+    """Look the password up in the macOS Keychain.
+
+    Item: generic password, service ``timeclock365``, account = the configured
+    username. Create it with::
+
+        security add-generic-password -a <username> -s timeclock365 -w -U
+
+    Returns an empty string on any failure (not macOS, no item, Keychain
+    locked, user denied access) so the caller can fall back to its usual
+    "not configured" handling.
+    """
+    if sys.platform != "darwin" or not username:
+        return ""
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password",
+             "-a", username, "-s", KEYCHAIN_SERVICE, "-w"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.debug("Keychain lookup failed: %s", exc)
+        return ""
+    if result.returncode != 0:
+        log.debug("Keychain lookup returned %d for service %s",
+                  result.returncode, KEYCHAIN_SERVICE)
+        return ""
+    return result.stdout.strip()
+
+
 def load_config(path: Optional[Path] = None) -> Config:
     """Load config from disk. Writes a template and exits if missing."""
     cfg_path = path or config_path()
@@ -231,6 +269,12 @@ def load_config(path: Optional[Path] = None) -> Config:
         username = ""
     if password in {"your-password", "your_password"}:
         password = ""
+
+    # A password in the config file wins, so that existing setups keep working.
+    # With the field left empty, fall back to the macOS Keychain — that keeps
+    # the credential out of a plaintext file on disk.
+    if not password:
+        password = _password_from_keychain(username)
 
     # Warn about world-readable config (skip on Windows where mode bits are meaningless).
     if sys.platform != "win32":

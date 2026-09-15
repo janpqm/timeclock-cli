@@ -228,3 +228,93 @@ list_recent_last = false
     )
     cfg = load_config(cfg_path)
     assert cfg.list_recent_last is False
+
+
+# ---------------------------------------------------------------- keychain fallback
+
+
+def _cfg_without_password(path: Path) -> None:
+    _write(
+        path,
+        f"""\
+[{SECTION}]
+username = user@example.com
+password =
+""",
+    )
+
+
+def test_keychain_used_when_password_empty(tmp_path: Path, monkeypatch) -> None:
+    cfg_path = tmp_path / "config.ini"
+    _cfg_without_password(cfg_path)
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(
+        cfgmod, "_password_from_keychain", lambda username: "from-keychain"
+    )
+
+    cfg = load_config(cfg_path)
+
+    assert cfg.password == "from-keychain"
+    assert cfg.is_complete()
+
+
+def test_config_password_takes_precedence_over_keychain(tmp_path: Path, monkeypatch) -> None:
+    cfg_path = tmp_path / "config.ini"
+    _write(
+        cfg_path,
+        f"""\
+[{SECTION}]
+username = user@example.com
+password = from-file
+""",
+    )
+    monkeypatch.setattr(
+        cfgmod,
+        "_password_from_keychain",
+        lambda username: pytest.fail("keychain must not be consulted"),
+    )
+
+    assert load_config(cfg_path).password == "from-file"
+
+
+def test_keychain_lookup_returns_empty_off_macos(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert cfgmod._password_from_keychain("user@example.com") == ""
+
+
+def test_keychain_lookup_returns_empty_without_username(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "platform", "darwin")
+    assert cfgmod._password_from_keychain("") == ""
+
+
+def test_keychain_lookup_handles_missing_item(monkeypatch) -> None:
+    """`security` exits non-zero when no matching item exists."""
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    class _Result:
+        returncode = 44
+        stdout = ""
+
+    monkeypatch.setattr(cfgmod.subprocess, "run", lambda *a, **k: _Result())
+    assert cfgmod._password_from_keychain("user@example.com") == ""
+
+
+def test_keychain_lookup_strips_trailing_newline(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    class _Result:
+        returncode = 0
+        stdout = "s3cret\n"
+
+    monkeypatch.setattr(cfgmod.subprocess, "run", lambda *a, **k: _Result())
+    assert cfgmod._password_from_keychain("user@example.com") == "s3cret"
+
+
+def test_keychain_lookup_survives_subprocess_error(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    def _boom(*a, **k):
+        raise OSError("security not found")
+
+    monkeypatch.setattr(cfgmod.subprocess, "run", _boom)
+    assert cfgmod._password_from_keychain("user@example.com") == ""
