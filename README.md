@@ -42,7 +42,7 @@ Only `username` and `password` actually need editing — everything else is pre-
 | Key                | Default                         | Meaning                                                                                                                                                |
 |--------------------|---------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `username`         | —                               | timeclock365 login                                                                                                                                     |
-| `password`         | —                               | timeclock365 password                                                                                                                                  |
+| `password`         | —                               | timeclock365 password. On macOS you may leave this empty and store it in the Keychain instead — see below.                                              |
 | `default_location` | `office`                        | used by `tc in` when no location is given. One of `office`, `home`, `abroad`, `field`. Aliases like `remote` → `home` and `work` → `office` also work. |
 | `force_overwrite`  | `false`                         | always overwrite the open session, even without `--force`                                                                                              |
 | `list_recent_last` | `true`                          | `tc list` order: `true` = oldest first / newest last (tail-style), `false` = newest first                                                              |
@@ -57,6 +57,18 @@ Only `username` and `password` actually need editing — everything else is pre-
 | `client_id`        | (the stable web-UI value)       | **Optional** pre-shared secred from the webUI. set here if the if timeclock365 ever changes the hardcoded value                                        |
 
 The file is created with mode `0600` (owner read/write only) so other users on the same machine cannot read your password.
+
+### Keeping the password out of the config file (macOS)
+
+On macOS you can leave `password` empty and keep the credential in the login Keychain instead:
+
+```sh
+security add-generic-password -a you@yourcompany.com -s timeclock365 -w -U
+```
+
+Omitting a value after `-w` makes `security` prompt for the password, so it never reaches your shell history. `tc` then looks the item up by service `timeclock365` and the configured `username`.
+
+A `password` set in the config file always wins, so existing setups keep working unchanged. The lookup falls back to "not configured" — the same error you get with an empty config — if the item is missing, the Keychain is locked, or you deny access.
 
 ## Usage
 
